@@ -429,6 +429,222 @@ Anycast используется на уровне глобальной сети
 
 ---
 
+## 5. Логическая схема данных
+
+### 5.1 ER-диаграмма (логическая модель без привязки к конкретным СУБД и шардингу)
+
+```mermaid
+erDiagram
+    users {
+        BIGINT user_id PK
+        VARCHAR username
+        VARCHAR email
+        BYTES password_hash
+        VARCHAR locale
+        VARCHAR timezone
+        ENUM subscription_status
+        INT xp_total
+        INT gems_balance
+        INT streak_days
+        DATE streak_last_date
+        TIMESTAMP created_at
+        TIMESTAMP updated_at
+    }
+
+    courses {
+        INT course_id PK
+        VARCHAR source_language
+        VARCHAR target_language
+        VARCHAR title
+        TEXT description
+        INT total_units
+        BOOLEAN is_active
+        TIMESTAMP created_at
+    }
+
+    units {
+        INT unit_id PK
+        INT course_id FK
+        INT ordinal
+        VARCHAR title
+        INT total_lessons
+    }
+
+    lessons {
+        INT lesson_id PK
+        INT unit_id FK
+        INT ordinal
+        VARCHAR lesson_type
+        INT xp_reward
+    }
+
+    exercises {
+        BIGINT exercise_id PK
+        INT lesson_id FK
+        ENUM exercise_type
+        JSONB content_tree
+        JSONB correct_answers
+        VARCHAR tts_audio_hash
+        JSONB metadata
+    }
+
+    user_course_progress {
+        BIGINT user_id FK
+        INT course_id FK
+        INT current_unit_id
+        FLOAT mastery_score
+        INT completed_lessons
+        TIMESTAMP last_activity_at
+    }
+
+    lesson_history {
+        BIGINT record_id PK
+        BIGINT user_id FK
+        INT lesson_id FK
+        INT xp_earned
+        INT time_spent_sec
+        SMALLINT mistakes_count
+        JSONB mistake_exercise_ids
+        TIMESTAMP completed_at
+    }
+
+    user_mistakes {
+        BIGINT user_id FK
+        BIGINT exercise_id FK
+        SMALLINT error_count
+        FLOAT recall_probability
+        TIMESTAMP next_review_at
+        TIMESTAMP last_seen_at
+    }
+
+    leagues {
+        INT league_id PK
+        ENUM tier
+        DATE week_start
+        DATE week_end
+    }
+
+    leaderboard_entries {
+        INT league_id FK
+        BIGINT user_id FK
+        INT weekly_xp
+        SMALLINT rank
+        TIMESTAMP updated_at
+    }
+
+    tts_audio {
+        VARCHAR audio_hash PK
+        VARCHAR phrase_text
+        VARCHAR language
+        VARCHAR voice_id
+        INT file_size_bytes
+        BYTES audio_blob
+    }
+
+    static_assets {
+        VARCHAR asset_hash PK
+        VARCHAR asset_path
+        ENUM asset_type
+        INT file_size_bytes
+        BYTES asset_blob
+    }
+
+    speech_samples {
+        BIGINT sample_id PK
+        BIGINT user_id FK
+        BIGINT exercise_id FK
+        FLOAT pronunciation_score
+        INT file_size_bytes
+        BYTES audio_blob
+        DATE expires_at
+        TIMESTAMP created_at
+    }
+
+    user_sessions {
+        VARCHAR session_token PK
+        BIGINT user_id FK
+        VARCHAR device_type
+        VARCHAR ip_address
+        TIMESTAMP created_at
+        TIMESTAMP expires_at
+    }
+
+    users ||--o{ user_course_progress : "enrolls in"
+    courses ||--|{ units : "contains"
+    units ||--|{ lessons : "contains"
+    lessons ||--|{ exercises : "contains"
+    courses ||--o{ user_course_progress : "tracked by"
+    users ||--o{ lesson_history : "completes"
+    lessons ||--o{ lesson_history : "results of"
+    users ||--o{ user_mistakes : "accumulates"
+    exercises ||--o{ user_mistakes : "source of"
+    exercises }o--o| tts_audio : "references"
+    users ||--o{ leaderboard_entries : "ranked in"
+    leagues ||--|{ leaderboard_entries : "contains"
+    users ||--o{ speech_samples : "records"
+    exercises ||--o{ speech_samples : "for"
+    users ||--o{ user_sessions : "authenticates"
+```
+
+---
+
+### 5.2 Описание полей и назначение сущностей
+
+| Сущность | Назначение | Ключевые поля |
+|---|---|---|
+| **users** | Профиль пользователя: аутентификация, геймификация (XP, gems, streak), настройки | `user_id` (PK), `email` (UQ), `password_hash`, `xp_total`, `gems_balance`, `streak_days`, `streak_last_date`, `subscription_status`, `locale`, `timezone` |
+| **courses** | Каталог курсов (языковые пары и предметы) | `course_id` (PK), `source_language`, `target_language`, `title`, `is_active` |
+| **units** | Юниты (разделы) внутри курса | `unit_id` (PK), `course_id` (FK → courses), `ordinal`, `title` |
+| **lessons** | Уроки внутри юнита | `lesson_id` (PK), `unit_id` (FK → units), `ordinal`, `lesson_type`, `xp_reward` |
+| **exercises** | Упражнения урока: синтаксическое дерево задания, правильные ответы, ссылка на TTS | `exercise_id` (PK), `lesson_id` (FK → lessons), `exercise_type`, `content_tree` (JSONB), `correct_answers` (JSONB), `tts_audio_hash` (FK → tts_audio) |
+| **user_course_progress** | Прогресс пользователя по конкретному курсу (дерево навыков) | (`user_id`, `course_id`) (Composite PK), `mastery_score`, `completed_lessons`, `last_activity_at` |
+| **lesson_history** | Журнал пройденных уроков: набранный XP, время, ошибки | `record_id` (PK), `user_id` (FK), `lesson_id` (FK), `xp_earned`, `time_spent_sec`, `mistake_exercise_ids` (JSONB) |
+| **user_mistakes** | Персональные ошибки для Practice Hub и ML-модели spaced repetition | (`user_id`, `exercise_id`) (Composite PK), `error_count`, `recall_probability`, `next_review_at` |
+| **leagues** | Еженедельные соревновательные лиги (Bronze, Silver, … Diamond) | `league_id` (PK), `tier`, `week_start`, `week_end` |
+| **leaderboard_entries** | Позиция пользователя в лидерборде лиги | (`league_id`, `user_id`) (Composite PK), `weekly_xp`, `rank` |
+| **tts_audio** | Хранилище pre-rendered аудиофрагментов речи (Amazon Polly, Opus) | `audio_hash` (PK, content-addressable), `phrase_text`, `language`, `audio_blob` |
+| **static_assets** | Статические медиа-ресурсы: иллюстрации персонажей, иконки, шрифты (WebP/SVG) | `asset_hash` (PK, content-addressable), `asset_path`, `asset_type`, `asset_blob` |
+| **speech_samples** | Голосовые записи пользователей для дообучения ML (TTL = 90 дней) | `sample_id` (PK), `user_id` (FK), `exercise_id` (FK), `pronunciation_score`, `audio_blob`, `expires_at` |
+| **user_sessions** | Сессии авторизации и кэш токенов аутентификации | `session_token` (PK), `user_id` (FK), `device_type`, `expires_at` |
+
+---
+
+### 5.3 Размеры данных, нагрузка на чтение/запись, консистентность и распределение ключей
+
+> Все расчёты основаны на метриках из раздела 2: DAU = 52,7 млн, Total Users = 600 млн, базовая плотность = 610 RPS на 1 действие/DAU/сутки.
+
+| Сущность | Кол-во строк / объектов | Размер строки | Общий объём | QPS чтение (avg / peak) | QPS запись (avg / peak) | Требования к консистентности | Распределение нагрузки по ключам |
+|---|---|---|---|---|---|---|---|
+| **users** | 600 млн | ~2 КБ | 1,20 ТБ | 2 440 / 4 270 | 2 440 / 4 270 | **Strong** — экономика XP/gems | Ключ `user_id`. Равномерная нагрузка, горячих ключей нет |
+| **courses** | ~280 | ~1 КБ | ~0,3 МБ | 1 220 / 2 135 | ~0 | **Eventual** — справочные данные | Ключ `course_id`. 10–15 популярных курсов → кэш |
+| **units** | ~20 тыс. | ~0,2 КБ | ~4 МБ | Совместно с courses/lessons | ~0 | **Eventual** — справочные данные | Ключ `unit_id`. Горячие: первые уровни популярных курсов |
+| **lessons** | ~500 тыс. | ~0,3 КБ | ~150 МБ | 2 440 / 4 270 | ~0 | **Eventual** — клиент кэширует (SQLite) | Ключ `lesson_id`. Начальные уроки значительно горячее |
+| **exercises** | 20 млн | ~10 КБ | 0,20 ТБ | 2 440 / 4 270 | ~0 | **Eventual** — immutable при публикации | Ключ `exercise_id`, индекс по `lesson_id`. Zipf-распределение |
+| **user_course_progress** | 30 млрд | ~0,5 КБ | 15,00 ТБ | 2 440 / 4 270 | 2 440 / 4 270 | **Strong** — разблокировка контента | Ключ (`user_id`, `course_id`). Равномерная по `user_id` |
+| **lesson_history** | ~77 млрд + 210,8 млн/сут | ~250 байт | 19,24 ТБ (+19,24 ТБ/год) | 610 / 1 068 | 2 440 / 4 270 | **Eventual** — append-only журнал | Партиционирование по `user_id` + `completed_at`. Равномерная |
+| **user_mistakes** | ~5 млрд | ~0,1 КБ | ~0,50 ТБ | 610 / 1 068 | 2 440 / 4 270 | **Strong** — ML spaced repetition | Ключ (`user_id`, `exercise_id`). Равномерная по `user_id` |
+| **leagues** | ~500 тыс. | ~0,1 КБ | ~50 МБ | Через leaderboard_entries | ~1 RPS (batch) | **Eventual** — еженедельное создание | Ключ `league_id`. Пакетное создание |
+| **leaderboard_entries** | ~52,7 млн активных | ~0,1 КБ | ~5,3 ГБ | 1 220 / 2 135 | 2 440 / 4 270 | **Eventual** — допустимо отставание 5–10 с | Ключ (`league_id`, `user_id`). Топ-30 каждой лиги → кэш |
+| **tts_audio** | ~20 млн файлов | ~20 КБ | 0,40 ТБ | 7 320 / 12 810 (CDN 95% Hit → Origin ~366 / 641) | ~17 RPS | **Eventual** — immutable blobs | Ключ `audio_hash`. Zipf: 5% фраз → 60% запросов. CDN |
+| **static_assets** | ~200 тыс. файлов | ~50 КБ | 0,01 ТБ | 6 100 / 10 675 (CDN 95% Hit → Origin ~305 / 534) | ~0 | **Eventual** — immutable by hash | Ключ `asset_hash`. Горячие: спрайт Duo, иконки UI. CDN |
+| **speech_samples** | ~71 млн (окно 90 дней) | ~40 КБ | 2,84 ТБ | ~10 RPS (batch ML) | ~9 RPS | **Eventual** — TTL, потеря допустима | Ключ `sample_id`. Равномерная. Автоудаление по `expires_at` |
+| **user_sessions** *(кэш)* | ~80 млн активных | ~0,3 КБ | ~24 ГБ (in-memory) | 25 620 / 44 835 | ~1 580 / 2 765 | **Strong** — инвалидация при logout | Ключ `session_token`. Равномерная. In-memory, TTL 30 дней |
+
+---
+
+### 5.4 Кэши и буферы
+
+| Кэш / Буфер | Хранимые данные | Объём (in-memory) | QPS чтение | QPS запись / инвалидация | TTL | Консистентность |
+|---|---|---|---|---|---|---|
+| **Session Cache** | `session_token → user_id`, device, expiry | ~24 ГБ (80 млн × 0,3 КБ) | 25 620 / 44 835 | 1 580 / 2 765 | 30 дней | **Strong** — немедленная инвалидация при logout / смене пароля |
+| **User Profile Cache** | Горячие поля профиля: `xp_total`, `gems`, `streak`, `locale` | ~16 ГБ (52,7 млн DAU × 0,3 КБ) | 2 440 / 4 270 | 2 440 / 4 270 (write-through при обновлении XP) | 15 мин (+ invalidate on write) | **Strong** — write-through, чтобы пользователь видел актуальный баланс |
+| **Leaderboard Top-N Cache** | Топ-30 записей каждой активной лиги | ~5 ГБ (1,76 млн лиг × 30 × 0,1 КБ) | 1 220 / 2 135 | Пересчёт каждые 5–10 с в фоне | 10 сек | **Eventual** — допустимо отставание ранга |
+| **Course Content Cache** | Сериализованные уроки и упражнения | ~2 ГБ (горячие 20% от 200 ГБ контента) | 2 440 / 4 270 | ~0 (invalidate при публикации контента) | 1 час (+ invalidate on publish) | **Eventual** — контент меняется редко |
+| **ML Inference Buffer** | Аудиозаписи речи в очереди на GPU-инференс | ~3 ГБ (пиковый буфер: 3 203 RPS × 40 КБ × 30 с окно) | — | 1 830 / 3 203 (enqueue) | Drain ≤ 200 мс | **At-most-once** — повторная отправка аудио клиентом при таймауте |
+| **CDN Edge Cache** | TTS аудио + статические ассеты | Распределён по 600+ Edge PoP (~500 ГБ суммарно) | 13 420 / 23 485 | Origin push при деплое / новом TTS | 24 часа (TTS), 7 дней (статика) | **Eventual** — immutable by hash, инвалидация через versioned URL |
+
+---
+
 ## Список источников
 
 1. <a id="source1"></a>[Duolingo Reports Fourth Quarter and Full Year 2025 Results — GlobeNewsWire](https://www.globenewswire.com/news-release/2026/02/26/3246047/0/en/duolingo-reports-fourth-quarter-and-full-year-2025-results.html)

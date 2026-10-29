@@ -77,29 +77,33 @@
 
 ##### 2.3.1.1 Размеры хранимых структур данных
 
-* **Профиль пользователя**: `~2 КБ` (auth, настройки, статус подписки, таймзона, баланс, стрик);
-* **Дерево навыков и прогресс**: `~0,5 КБ` (ID курса, прогресс по юнитам, mastery scores);
-* **Результат пройденного урока (история)**: `~250 байт` (timestamp, ID урока, набранный XP, затраченное время, массив ошибок);
+* **Учетная запись пользователя (users)**: `~0,5 КБ` (auth, настройки, локаль, таймзона, статус подписки, без учета ультра-горячей геймификации);
+* **Геймификация и баланс (user_gamification)**: `~100 байт` (user_id, xp_total, gems_balance, streak_days, streak_last_date, updated_at);
+* **Денормализованный прогресс по курсам (user_course_progress)**: `~1–2 КБ` на пользователя (1 запись на `user_id` с JSONB-документом активных курсов, уровней и mastery score вместо 50 отдельных строк);
+* **Результат пройденного урока (lesson_history / dwh_events)**: `~250 байт` (timestamp, ID урока, набранный XP, затраченное время, массив ошибок);
 * **Элемент контента курса**: `~10 КБ` (упражнение, синтаксическое дерево, ответы, метаданные, хэш аудиофайла);
-* **Аудиофрагмент TTS**: `~20 КБ` (кодек Opus, 24 kbps mono, 3–5 с);
-* **Речевая запись пользователя**: `~40 КБ` (Opus, 16 kbps mono, 3–4 с). 99,5% записей оцениваются in-memory на GPU (EC2 P3) и сбрасываются. 0,5% сохраняются для дообучения ML со скользящим TTL = 90 дней [14].
+* **Метаданные аудиофрагмента TTS (в БД)**: `~150 байт` (хэш, текст, язык, голос, размер, ключ в S3 `storage_key`). Сам аудиофайл (`~20 КБ`, кодек Opus, 24 kbps mono, 3–5 с) хранится в объектном хранилище S3/MinIO и кэшируется на Edge CDN;
+* **Метаданные статических медиа-ассетов (в БД)**: `~150 байт` (хэш, путь, тип, размер, `storage_key`). Файлы иллюстраций и спрайтов (`~50 КБ`) хранятся в объектном хранилище S3 и раздаются через Edge CDN;
+* **Речевая запись пользователя (speech_samples)**: метаданные в БД `~200 байт` (sample_id, user_id, exercise_id, score, `storage_key`, TTL). Сам аудиофайл (`~40 КБ`, Opus, 16 kbps mono, 3–4 с) помещается в объектное хранилище S3. 99,5% записей оцениваются in-memory на GPU (EC2 P3) и сбрасываются. 0,5% сохраняются в S3 для дообучения ML со скользящим TTL = 90 дней (S3 Lifecycle) [14].
 
 ##### 2.3.1.2 Статический объём данных (As-Is)
 
 Расчёт ведётся от накопленной базы аккаунтов (Total Users = 600 млн):
 
-| Категория данных | Объём записей / сущностей | Размер записи | Общий объём (ТБ) |
-|---|---|---|---|
-| **База профилей (Total Users)** | 600 млн аккаунтов | 2 КБ | 1,20 ТБ |
-| **База прогресса курсов** | 600 млн пользователей × в среднем 50 записей = 30 млрд | 0,5 КБ | 15,00 ТБ |
-| **Каталог контента всех курсов** | 280+ курсов (40+ языков) [2] × ~70 тыс. заданий ≈ 20 млн заданий | 10 КБ | 0,20 ТБ |
-| **Аудиобиблиотека TTS (Pre-rendered)** | ~20 млн уникальных фраз и слов (Amazon Polly) | 20 КБ | 0,40 ТБ |
-| **Статические медиа-ассеты (вектор/WebP)** | ~200 тыс. иллюстраций персонажей и UI | 50 КБ | 0,01 ТБ |
-| **Накопленная история уроков (архив за 1 год)** | ~77 млрд записей | 250 байт | 19,24 ТБ |
-| **ML-выборка голосовых записей (окно 90 дней)** | 52,7 млн DAU × 3 зап/день × 0,005 × 90 дней ≈ 71 млн файлов | 40 КБ | 2,84 ТБ |
-| **Итого статический объем (As-Is)** | — | — | **~38,89 ТБ** |
+| Категория данных | Объём записей / сущностей | Размер записи | Общий объём (ТБ) | Хранилище |
+|---|---|---|---|---|
+| **Учетные записи (users)** | 600 млн аккаунтов | 0,5 КБ | 0,30 ТБ | RDBMS / NoSQL |
+| **Профиль геймификации (user_gamification)** | 600 млн аккаунтов | 0,1 КБ (100 Б) | 0,06 ТБ | In-Memory / Key-Value |
+| **Денормализованный прогресс курсов (user_course_progress)** | 600 млн пользователей (1 строка / user) | 1,5 КБ | 0,90 ТБ | Document / NoSQL |
+| **Каталог контента всех курсов (exercises, lessons, units, courses)** | 280+ курсов (40+ языков) [2] × ~70 тыс. заданий ≈ 20 млн заданий | 10 КБ | 0,20 ТБ | RDBMS / Cache |
+| **Метаданные TTS + ассетов в БД** | ~20,2 млн записей метаданных | 0,15 КБ | 0,003 ТБ (~3 ГБ) | RDBMS |
+| **Аудиобиблиотека TTS (Pre-rendered, S3)** | ~20 млн уникальных фраз и слов (Amazon Polly) | 20 КБ | 0,40 ТБ | S3 Object Storage + CDN |
+| **Статические медиа-ассеты (S3)** | ~200 тыс. иллюстраций персонажей и UI | 50 КБ | 0,01 ТБ | S3 Object Storage + CDN |
+| **Накопленная история уроков и DWH-события (архив за 1 год)** | ~77 млрд записей | 250 байт | 19,24 ТБ | ClickHouse / DWH Lake |
+| **ML-выборка голосовых записей пользователей (S3, окно 90 дней)** | 52,7 млн DAU × 3 зап/день × 0,005 × 90 дней ≈ 71 млн файлов | 40 КБ | 2,84 ТБ | S3 Object Storage (TTL 90d) |
+| **Итого статический объем (As-Is)** | — | — | **~23,95 ТБ** | — |
 
-> **Вывод 1**: Для исходного размещения данных требуется полезная ёмкость **~39 ТБ**.
+> **Вывод 1**: За счёт устранения антипаттерна $User \times Course$ (перемножения сущностей) и денормализации прогресса до 1 записи на пользователя (600 млн вместо 30 млрд строк), а также четкого разделения бинарных медиаданных (S3) и метаданных (БД), полезный As-Is объём базы данных сократился, а суммарная полезная ёмкость всех типов хранилищ (БД + DWH + Object Storage) составила **~24 ТБ** (ранее 38,9 ТБ).
 
 ##### 2.3.1.3 Динамика прироста данных
 
@@ -431,7 +435,15 @@ Anycast используется на уровне глобальной сети
 
 ## 5. Логическая схема данных
 
-### 5.1 ER-диаграмма (логическая модель без привязки к конкретным СУБД и шардингу)
+### 5.1 Концептуальная архитектура и ER-диаграмма
+
+В соответствии с требованиями к проектированию высоконагруженных систем (HighLoad) схема данных спроектирована как единая концептуальная модель с отказом от реляционной сверхнормализации (3NF) и антипаттерна прямого перемножения сущностей ($User \times Item$):
+1. **Изоляция горячих данных геймификации**: Часто обновляемые поля (XP, gems, стрик) отделены от «холодного» учетного профиля (`users`) в сущность `user_gamification`. Это предотвращает деградацию и сбои сервиса авторизации при пиковых нагрузках на геймификацию и позволяет вынести последнюю в специализированное In-Memory / Key-Value хранилище.
+2. **Денормализация прогресса курсов**: Вместо плоской таблицы связки на 30 млрд строк `(user_id, course_id)` прогресс хранится по принципу «одна запись на пользователя» (`user_course_progress`) с вложенным документом активных курсов (`active_courses: JSONB`). Это снизило количество строк с 30 млрд до 600 млн.
+3. **Контур DWH и аналитических событий (`dwh_events`)**: Добавлено хранилище потока событий (клики, завершение уроков, промежуточные ответы, брошенные сессии, аудио-интеракции), служащее единым источником данных для ML-моделей адаптивной сложности, Spaced Repetition и рекомендательных выборок.
+4. **Адаптивное обучение и персональные ошибки (`user_mistakes`)**: Применен паттерн персонального среза (Dual Indexing) — per-user хранилище активных проблемных упражнений (`recent_mistakes: JSONB`), формируемое асинхронно / near-line процессами из DWH, без создания миллиардов связующих строк $User \times Exercise$.
+5. **Четкое разделение метаданных и объектного хранилища (S3 / Object Storage)**: В таблицах базы данных исключены любые бинарные блобы (`BYTES *_blob`). БД хранит исключительно компактные метаданные (`storage_key`, размер, кодек, score, TTL), а бинарные файлы (TTS-аудио, медиа-спрайты, аудиозаписи пользователей) размещаются в распределенном объектном хранилище (S3/MinIO) с кэшированием статики на Edge CDN и lifecycle-политикой TTL = 90 дней для пользовательской речи.
+6. **Денормализация когорт лидербордов (`league_cohorts`)**: Соревновательные лиги формируются изолированными когортами (комнатами) по ~30 пользователей (`cohort_id`), где турнирная таблица хранится целиком внутри документа когорты (`members_top30: JSONB`).
 
 ```mermaid
 erDiagram
@@ -443,11 +455,31 @@ erDiagram
         VARCHAR locale
         VARCHAR timezone
         ENUM subscription_status
+        BOOLEAN is_deleted
+        TIMESTAMP created_at
+        TIMESTAMP updated_at
+    }
+
+    user_gamification {
+        BIGINT user_id PK "FK -> users.user_id"
         INT xp_total
         INT gems_balance
         INT streak_days
         DATE streak_last_date
-        TIMESTAMP created_at
+        INT hearts_count
+        TIMESTAMP updated_at
+    }
+
+    user_course_progress {
+        BIGINT user_id PK "FK -> users.user_id"
+        INT current_course_id
+        JSONB active_courses "Массив курсов: course_id, unit, lessons, mastery"
+        TIMESTAMP last_activity_at
+    }
+
+    user_mistakes {
+        BIGINT user_id PK "FK -> users.user_id"
+        JSONB recent_mistakes "Массив ошибок: exercise_id, error_count, recall_prob, next_review"
         TIMESTAMP updated_at
     }
 
@@ -457,7 +489,7 @@ erDiagram
         VARCHAR target_language
         VARCHAR title
         TEXT description
-        INT total_units
+        INT total_units "Денормализованный счетчик для read-heavy"
         BOOLEAN is_active
         TIMESTAMP created_at
     }
@@ -484,69 +516,42 @@ erDiagram
         ENUM exercise_type
         JSONB content_tree
         JSONB correct_answers
-        VARCHAR tts_audio_hash
+        VARCHAR tts_audio_hash FK
         JSONB metadata
     }
 
-    user_course_progress {
-        BIGINT user_id FK
-        INT course_id FK
-        INT current_unit_id
-        FLOAT mastery_score
-        INT completed_lessons
-        TIMESTAMP last_activity_at
-    }
-
-    lesson_history {
-        BIGINT record_id PK
-        BIGINT user_id FK
-        INT lesson_id FK
-        INT xp_earned
-        INT time_spent_sec
-        SMALLINT mistakes_count
-        JSONB mistake_exercise_ids
-        TIMESTAMP completed_at
-    }
-
-    user_mistakes {
-        BIGINT user_id FK
-        BIGINT exercise_id FK
-        SMALLINT error_count
-        FLOAT recall_probability
-        TIMESTAMP next_review_at
-        TIMESTAMP last_seen_at
-    }
-
-    leagues {
-        INT league_id PK
-        ENUM tier
-        DATE week_start
-        DATE week_end
-    }
-
-    leaderboard_entries {
-        INT league_id FK
-        BIGINT user_id FK
-        INT weekly_xp
-        SMALLINT rank
+    league_cohorts {
+        BIGINT cohort_id PK
+        ENUM tier "Bronze, Silver, Gold, etc."
+        INT week_number
+        INT year
+        JSONB members_top30 "Денормализованный Top-30: user_id, xp, rank"
         TIMESTAMP updated_at
     }
 
+    dwh_events {
+        BIGINT event_id PK
+        BIGINT user_id FK
+        VARCHAR event_type "lesson_finish, mistake, tap, audio_play"
+        JSONB payload "Длительность, XP, ошибки, клиентские метрики"
+        TIMESTAMP created_at
+    }
+
     tts_audio {
-        VARCHAR audio_hash PK
+        VARCHAR audio_hash PK "Content-addressable SHA256"
         VARCHAR phrase_text
         VARCHAR language
         VARCHAR voice_id
         INT file_size_bytes
-        BYTES audio_blob
+        VARCHAR storage_key "Ссылка/ключ в Object Storage"
     }
 
     static_assets {
-        VARCHAR asset_hash PK
+        VARCHAR asset_hash PK "SHA256"
         VARCHAR asset_path
-        ENUM asset_type
+        ENUM asset_type "character_svg, icon_webp, font"
         INT file_size_bytes
-        BYTES asset_blob
+        VARCHAR storage_key "Ссылка/ключ в Object Storage"
     }
 
     speech_samples {
@@ -555,8 +560,8 @@ erDiagram
         BIGINT exercise_id FK
         FLOAT pronunciation_score
         INT file_size_bytes
-        BYTES audio_blob
-        DATE expires_at
+        VARCHAR storage_key "Ссылка/ключ в Object Storage"
+        TIMESTAMP expires_at "TTL = 90 дней (S3 Lifecycle)"
         TIMESTAMP created_at
     }
 
@@ -569,66 +574,98 @@ erDiagram
         TIMESTAMP expires_at
     }
 
-    users ||--o{ user_course_progress : "enrolls in"
+    object_storage_tts {
+        VARCHAR s3_key PK "Ключ аудиофайла TTS"
+        BLOB opus_audio "Файл речи (Amazon Polly, Opus 24 kbps)"
+    }
+
+    object_storage_media {
+        VARCHAR s3_key PK "Ключ медиа-ассета"
+        BLOB static_media "UI-спрайты, SVG, WebP"
+    }
+
+    object_storage_user_speech {
+        VARCHAR s3_key PK "Ключ записи пользователя"
+        BLOB user_speech_opus "Запись речи (0.5% сэмплов, TTL 90d)"
+    }
+
+    %% Связи профиля и геймификации
+    users ||--|| user_gamification : "tracks (1:1)"
+    users ||--|| user_course_progress : "maintains (1:1)"
+    users ||--|| user_mistakes : "practice hub (1:1)"
+    users ||--o{ user_sessions : "authenticates"
+
+    %% Дерево контента
     courses ||--|{ units : "contains"
     units ||--|{ lessons : "contains"
     lessons ||--|{ exercises : "contains"
-    courses ||--o{ user_course_progress : "tracked by"
-    users ||--o{ lesson_history : "completes"
-    lessons ||--o{ lesson_history : "results of"
-    users ||--o{ user_mistakes : "accumulates"
-    exercises ||--o{ user_mistakes : "source of"
-    exercises }o--o| tts_audio : "references"
-    users ||--o{ leaderboard_entries : "ranked in"
-    leagues ||--|{ leaderboard_entries : "contains"
-    users ||--o{ speech_samples : "records"
-    exercises ||--o{ speech_samples : "for"
-    users ||--o{ user_sessions : "authenticates"
+    exercises }o--o| tts_audio : "references (meta)"
+
+    %% Аналитика и DWH
+    users ||--o{ dwh_events : "streams events"
+    dwh_events ..> user_mistakes : "asynchronously builds"
+
+    %% Соревнования
+    league_cohorts }o--o{ users : "groups 30 users"
+
+    %% Голосовые сэмплы
+    users ||--o{ speech_samples : "records (meta)"
+    exercises ||--o{ speech_samples : "evaluates (meta)"
+
+    %% Связи метаданных с объектным хранилищем
+    tts_audio ||--|| object_storage_tts : "stores file in S3"
+    static_assets ||--|| object_storage_media : "stores file in S3"
+    speech_samples ||--|| object_storage_user_speech : "persists in S3 (TTL 90d)"
 ```
 
 ---
 
 ### 5.2 Описание полей и назначение сущностей
 
-| Сущность | Назначение | Ключевые поля |
+| Сущность | Назначение и архитектурная роль | Ключевые поля |
 |---|---|---|
-| **users** | Профиль пользователя: аутентификация, геймификация (XP, gems, streak), настройки | `user_id` (PK), `email` (UQ), `password_hash`, `xp_total`, `gems_balance`, `streak_days`, `streak_last_date`, `subscription_status`, `locale`, `timezone` |
-| **courses** | Каталог курсов (языковые пары и предметы) | `course_id` (PK), `source_language`, `target_language`, `title`, `is_active` |
-| **units** | Юниты (разделы) внутри курса | `unit_id` (PK), `course_id` (FK → courses), `ordinal`, `title` |
-| **lessons** | Уроки внутри юнита | `lesson_id` (PK), `unit_id` (FK → units), `ordinal`, `lesson_type`, `xp_reward` |
-| **exercises** | Упражнения урока: синтаксическое дерево задания, правильные ответы, ссылка на TTS | `exercise_id` (PK), `lesson_id` (FK → lessons), `exercise_type`, `content_tree` (JSONB), `correct_answers` (JSONB), `tts_audio_hash` (FK → tts_audio) |
-| **user_course_progress** | Прогресс пользователя по конкретному курсу (дерево навыков) | (`user_id`, `course_id`) (Composite PK), `mastery_score`, `completed_lessons`, `last_activity_at` |
-| **lesson_history** | Журнал пройденных уроков: набранный XP, время, ошибки | `record_id` (PK), `user_id` (FK), `lesson_id` (FK), `xp_earned`, `time_spent_sec`, `mistake_exercise_ids` (JSONB) |
-| **user_mistakes** | Персональные ошибки для Practice Hub и ML-модели spaced repetition | (`user_id`, `exercise_id`) (Composite PK), `error_count`, `recall_probability`, `next_review_at` |
-| **leagues** | Еженедельные соревновательные лиги (Bronze, Silver, … Diamond) | `league_id` (PK), `tier`, `week_start`, `week_end` |
-| **leaderboard_entries** | Позиция пользователя в лидерборде лиги | (`league_id`, `user_id`) (Composite PK), `weekly_xp`, `rank` |
-| **tts_audio** | Хранилище pre-rendered аудиофрагментов речи (Amazon Polly, Opus) | `audio_hash` (PK, content-addressable), `phrase_text`, `language`, `audio_blob` |
-| **static_assets** | Статические медиа-ресурсы: иллюстрации персонажей, иконки, шрифты (WebP/SVG) | `asset_hash` (PK, content-addressable), `asset_path`, `asset_type`, `asset_blob` |
-| **speech_samples** | Голосовые записи пользователей для дообучения ML (TTL = 90 дней) | `sample_id` (PK), `user_id` (FK), `exercise_id` (FK), `pronunciation_score`, `audio_blob`, `expires_at` |
-| **user_sessions** | Сессии авторизации и кэш токенов аутентификации | `session_token` (PK), `user_id` (FK), `device_type`, `expires_at` |
+| **users** | **Холодный учетный профиль**: аутентификация, паспортные данные и настройки. Избавлен от высокочастотных апдейтов геймификации. Мягкое удаление (`is_deleted`) вместо физического `DELETE`. | `user_id` (PK), `email` (UQ), `password_hash`, `subscription_status`, `locale`, `timezone`, `is_deleted`, `created_at`, `updated_at` |
+| **user_gamification** | **Ультра-горячий профиль геймификации** (1:1 к `user_id`). Принимает частые инкременты при завершении каждого урока. Изолирован от auth-сервиса (может размещаться в Key-Value / In-Memory хранилище). | `user_id` (PK, FK → users), `xp_total`, `gems_balance`, `streak_days`, `streak_last_date`, `hearts_count`, `updated_at` |
+| **user_course_progress** | **Денормализованный прогресс по курсам** (1 строка на пользователя). Избавление от антипаттерна $User \times Course$. Хранит компактный JSONB-документ со списком всех активных языков, текущих юнитов и mastery-баллов. | `user_id` (PK, FK → users), `current_course_id`, `active_courses` (JSONB), `last_activity_at` |
+| **user_mistakes** | **Персональный срез ошибок** для Practice Hub и Spaced Repetition (1:1 к `user_id`). Формируется асинхронно из DWH; хранит массив недавних проблемных упражнений и рассчитанные ML вероятности забывания. | `user_id` (PK, FK → users), `recent_mistakes` (JSONB), `updated_at` |
+| **courses** | **Каталог курсов** (языковые пары и дисциплины). Поле `total_units` зафиксировано как денормализованный счетчик для избежания дорогого `COUNT(*)` при read-heavy нагрузке. | `course_id` (PK), `source_language`, `target_language`, `title`, `total_units` (денормализовано), `is_active` |
+| **units** | Юниты (тематические разделы) курса. Справочные immutable-данные. | `unit_id` (PK), `course_id` (FK → courses), `ordinal`, `title`, `total_lessons` |
+| **lessons** | Уроки внутри юнита (микросессии на 2,5–3 минуты). | `lesson_id` (PK), `unit_id` (FK → units), `ordinal`, `lesson_type`, `xp_reward` |
+| **exercises** | Упражнения урока: синтаксическое дерево задания, варианты, правильные ответы, ссылка на метаданные TTS. | `exercise_id` (PK), `lesson_id` (FK → lessons), `exercise_type`, `content_tree` (JSONB), `correct_answers` (JSONB), `tts_audio_hash` (FK) |
+| **league_cohorts** | **Денормализованная когорта лиги** (комната на ~30 пользователей). Вместо реляционной связки N:M хранит массив участников с их еженедельным XP в JSONB-структуре `members_top30`. | `cohort_id` (PK), `tier`, `week_number`, `year`, `members_top30` (JSONB), `updated_at` |
+| **dwh_events** | **Поток событий DWH (Event Store)**: append-only лог событий (клики, завершение уроков, промежуточные ответы, прослушивания). Источник данных для ML, рекомендаций и аналитики. | `event_id` (PK), `user_id` (FK), `event_type`, `payload` (JSONB), `created_at` |
+| **tts_audio** | **Метаданные синтезированной речи** (Amazon Polly). Хранит только ссылку `storage_key` на объект в S3, хэш текста и размер. Бинарные файлы в БД отсутствуют! | `audio_hash` (PK, SHA256), `phrase_text`, `language`, `voice_id`, `file_size_bytes`, `storage_key` |
+| **static_assets** | **Метаданные статических UI-ассетов** (иллюстрации персонажей Duo, векторная графика, WebP/SVG). Содержит путь и `storage_key` для раздачи через Edge CDN. | `asset_hash` (PK, SHA256), `asset_path`, `asset_type`, `file_size_bytes`, `storage_key` |
+| **speech_samples** | **Метаданные ML-выборки речевых записей пользователей** (0,5% записей для дообучения). Хранит `storage_key` в S3 и срок жизни `expires_at` (скользящее окно TTL = 90 дней). | `sample_id` (PK), `user_id` (FK), `exercise_id` (FK), `pronunciation_score`, `storage_key`, `expires_at`, `created_at` |
+| **user_sessions** | Сессии авторизации и кэш токенов аутентификации. | `session_token` (PK), `user_id` (FK), `device_type`, `ip_address`, `expires_at` |
+| **object_storage_*** | **Контур объектного хранилища (S3 / MinIO)**: физическое хранение блобов аудио TTS, медиа-спрайтов и аудиозаписей пользователей. Вынесен за пределы СУБД. | `s3_key` (PK), бинарное содержимое (Opus / WebP / SVG) |
 
 ---
 
 ### 5.3 Размеры данных, нагрузка на чтение/запись, консистентность и распределение ключей
 
-> Все расчёты основаны на метриках из раздела 2: DAU = 52,7 млн, Total Users = 600 млн, базовая плотность = 610 RPS на 1 действие/DAU/сутки.
+> Все расчёты согласованы с продуктовыми метриками (DAU = 52,7 млн, Total Users = 600 млн, базовая плотность = 610 RPS на 1 действие/DAU/сутки).
+> За счет выноса блобов в S3 и денормализации прогресса курсов (с 30 млрд до 600 млн строк) реляционная база избавлена от раздувания, а архитектура строго соответствует принципам HighLoad.
 
 | Сущность | Кол-во строк / объектов | Размер строки | Общий объём | QPS чтение (avg / peak) | QPS запись (avg / peak) | Требования к консистентности | Распределение нагрузки по ключам |
 |---|---|---|---|---|---|---|---|
-| **users** | 600 млн | ~2 КБ | 1,20 ТБ | 2 440 / 4 270 | 2 440 / 4 270 | **Strong** — экономика XP/gems | Ключ `user_id`. Равномерная нагрузка, горячих ключей нет |
-| **courses** | ~280 | ~1 КБ | ~0,3 МБ | 1 220 / 2 135 | ~0 | **Eventual** — справочные данные | Ключ `course_id`. 10–15 популярных курсов → кэш |
-| **units** | ~20 тыс. | ~0,2 КБ | ~4 МБ | Совместно с courses/lessons | ~0 | **Eventual** — справочные данные | Ключ `unit_id`. Горячие: первые уровни популярных курсов |
-| **lessons** | ~500 тыс. | ~0,3 КБ | ~150 МБ | 2 440 / 4 270 | ~0 | **Eventual** — клиент кэширует (SQLite) | Ключ `lesson_id`. Начальные уроки значительно горячее |
-| **exercises** | 20 млн | ~10 КБ | 0,20 ТБ | 2 440 / 4 270 | ~0 | **Eventual** — immutable при публикации | Ключ `exercise_id`, индекс по `lesson_id`. Zipf-распределение |
-| **user_course_progress** | 30 млрд | ~0,5 КБ | 15,00 ТБ | 2 440 / 4 270 | 2 440 / 4 270 | **Strong** — разблокировка контента | Ключ (`user_id`, `course_id`). Равномерная по `user_id` |
-| **lesson_history** | ~77 млрд + 210,8 млн/сут | ~250 байт | 19,24 ТБ (+19,24 ТБ/год) | 610 / 1 068 | 2 440 / 4 270 | **Eventual** — append-only журнал | Партиционирование по `user_id` + `completed_at`. Равномерная |
-| **user_mistakes** | ~5 млрд | ~0,1 КБ | ~0,50 ТБ | 610 / 1 068 | 2 440 / 4 270 | **Strong** — ML spaced repetition | Ключ (`user_id`, `exercise_id`). Равномерная по `user_id` |
-| **leagues** | ~500 тыс. | ~0,1 КБ | ~50 МБ | Через leaderboard_entries | ~1 RPS (batch) | **Eventual** — еженедельное создание | Ключ `league_id`. Пакетное создание |
-| **leaderboard_entries** | ~52,7 млн активных | ~0,1 КБ | ~5,3 ГБ | 1 220 / 2 135 | 2 440 / 4 270 | **Eventual** — допустимо отставание 5–10 с | Ключ (`league_id`, `user_id`). Топ-30 каждой лиги → кэш |
-| **tts_audio** | ~20 млн файлов | ~20 КБ | 0,40 ТБ | 7 320 / 12 810 (CDN 95% Hit → Origin ~366 / 641) | ~17 RPS | **Eventual** — immutable blobs | Ключ `audio_hash`. Zipf: 5% фраз → 60% запросов. CDN |
-| **static_assets** | ~200 тыс. файлов | ~50 КБ | 0,01 ТБ | 6 100 / 10 675 (CDN 95% Hit → Origin ~305 / 534) | ~0 | **Eventual** — immutable by hash | Ключ `asset_hash`. Горячие: спрайт Duo, иконки UI. CDN |
-| **speech_samples** | ~71 млн (окно 90 дней) | ~40 КБ | 2,84 ТБ | ~10 RPS (batch ML) | ~9 RPS | **Eventual** — TTL, потеря допустима | Ключ `sample_id`. Равномерная. Автоудаление по `expires_at` |
-| **user_sessions** *(кэш)* | ~80 млн активных | ~0,3 КБ | ~24 ГБ (in-memory) | 25 620 / 44 835 | ~1 580 / 2 765 | **Strong** — инвалидация при logout | Ключ `session_token`. Равномерная. In-memory, TTL 30 дней |
+| **users** | 600 млн | ~0,5 КБ | 0,30 ТБ | 2 440 / 4 270 | ~1,6 / 2,8 (только auth/reg/settings) | **Strong** — аутентификация и безопасность | Ключ `user_id`. Равномерное шардирование, холодных данных много |
+| **user_gamification** | 600 млн | ~0,1 КБ (100 Б) | 0,06 ТБ | 2 440 / 4 270 | 2 440 / 4 270 | **Strong** — инкремент XP, защита от накруток | Ключ `user_id`. Горячая запись при сдаче уроков. Размещается в In-Memory / Key-Value |
+| **user_course_progress** | 600 млн *(1 на user)* | ~1,5 КБ | 0,90 ТБ | 2 440 / 4 270 | 2 440 / 4 270 | **Strong** — разблокировка уроков | Ключ `user_id`. Денормализованный JSONB сократил объем с 30 млрд строк до 600 млн |
+| **user_mistakes** | 600 млн *(1 на user)* | ~0,5 КБ | 0,30 ТБ | 610 / 1 068 | ~100 RPS (batch near-line) | **Eventual** — аналитический срез | Ключ `user_id`. Формируется асинхронно из DWH для Practice Hub |
+| **courses** | ~280 | ~1 КБ | ~0,3 МБ | 1 220 / 2 135 | ~0 | **Eventual** — справочные данные | Ключ `course_id`. Денормализован `total_units`. 100% помещается в кэш |
+| **units** | ~20 тыс. | ~0,2 КБ | ~4 МБ | Совместно с courses | ~0 | **Eventual** — справочные данные | Ключ `unit_id`. Горячие: базовые юниты популярных курсов |
+| **lessons** | ~500 тыс. | ~0,3 КБ | ~150 МБ | 2 440 / 4 270 | ~0 | **Eventual** — кэшируется клиентом | Ключ `lesson_id`. Zipf-распределение по популярности |
+| **exercises** | 20 млн | ~10 КБ | 0,20 ТБ | 2 440 / 4 270 | ~0 | **Eventual** — immutable при релизе | Ключ `exercise_id`, вторичный индекс по `lesson_id` |
+| **league_cohorts** | ~1,76 млн комнат/нед | ~3 КБ (Top-30) | ~5,3 ГБ | 1 220 / 2 135 | 2 440 / 4 270 (в кэш) | **Eventual** — допустимо отставание 5–10 с | Ключ `cohort_id`. 30 пользователей в одном документе; запись амортизируется кэшем |
+| **dwh_events** | ~77 млрд + 210,8 млн/сут | ~250 байт | 19,24 ТБ (+19,24 ТБ/год) | ~50 RPS (ML/DWH) | 2 440 / 4 270 (append-only) | **Eventual** — поток событий | Партиционирование по дате (`created_at`) и `user_id`. ClickHouse / Data Lake |
+| **tts_audio (метаданные)** | ~20 млн записей | ~150 байт | ~3 ГБ | 7 320 / 12 810 (CDN 95% → Origin ~366) | ~17 RPS | **Eventual** — immutable по SHA256 | Ключ `audio_hash`. Бинарники вынесены в S3 (`object_storage_tts`) |
+| **static_assets (метаданные)**| ~200 тыс. записей | ~150 байт | ~30 МБ | 6 100 / 10 675 (CDN 95% → Origin ~305) | ~0 | **Eventual** — immutable по SHA256 | Ключ `asset_hash`. Бинарники вынесены в S3 (`object_storage_media`) |
+| **speech_samples (метаданные)**| ~71 млн (окно 90 дней)| ~200 байт | ~14,2 ГБ | ~10 RPS (batch ML) | ~9 RPS (0,5% выборки) | **Eventual** — скользящий TTL 90d | Ключ `sample_id`. Бинарники в S3 (`object_storage_user_speech`) с S3 Lifecycle TTL |
+| **user_sessions** *(кэш)* | ~80 млн активных | ~0,3 КБ | ~24 ГБ (in-memory) | 25 620 / 44 835 | ~1 580 / 2 765 | **Strong** — отзыв токена при logout | Ключ `session_token`. In-memory Redis кластер |
+| **S3: TTS Audio** | ~20 млн файлов | ~20 КБ | 0,40 ТБ | 7 320 / 12 810 (CDN) | ~17 RPS | **Eventual** — объектное хранилище | S3 Key = `audio_hash.opus`. Раздача через CloudFront |
+| **S3: Static Assets** | ~200 тыс. файлов | ~50 КБ | 0,01 ТБ | 6 100 / 10 675 (CDN) | ~0 | **Eventual** — объектное хранилище | S3 Key = `asset_hash.ext`. Раздача через CloudFront |
+| **S3: User Speech Samples** | ~71 млн файлов | ~40 КБ | 2,84 ТБ | ~10 RPS (ML batch) | ~9 RPS | **Eventual** — S3 Lifecycle TTL = 90d | S3 Key = `sample_id.opus`. Автоудаление через 90 дней |
 
 ---
 
@@ -637,11 +674,220 @@ erDiagram
 | Кэш / Буфер | Хранимые данные | Объём (in-memory) | QPS чтение | QPS запись / инвалидация | TTL | Консистентность |
 |---|---|---|---|---|---|---|
 | **Session Cache** | `session_token → user_id`, device, expiry | ~24 ГБ (80 млн × 0,3 КБ) | 25 620 / 44 835 | 1 580 / 2 765 | 30 дней | **Strong** — немедленная инвалидация при logout / смене пароля |
-| **User Profile Cache** | Горячие поля профиля: `xp_total`, `gems`, `streak`, `locale` | ~16 ГБ (52,7 млн DAU × 0,3 КБ) | 2 440 / 4 270 | 2 440 / 4 270 (write-through при обновлении XP) | 15 мин (+ invalidate on write) | **Strong** — write-through, чтобы пользователь видел актуальный баланс |
-| **Leaderboard Top-N Cache** | Топ-30 записей каждой активной лиги | ~5 ГБ (1,76 млн лиг × 30 × 0,1 КБ) | 1 220 / 2 135 | Пересчёт каждые 5–10 с в фоне | 10 сек | **Eventual** — допустимо отставание ранга |
-| **Course Content Cache** | Сериализованные уроки и упражнения | ~2 ГБ (горячие 20% от 200 ГБ контента) | 2 440 / 4 270 | ~0 (invalidate при публикации контента) | 1 час (+ invalidate on publish) | **Eventual** — контент меняется редко |
-| **ML Inference Buffer** | Аудиозаписи речи в очереди на GPU-инференс | ~3 ГБ (пиковый буфер: 3 203 RPS × 40 КБ × 30 с окно) | — | 1 830 / 3 203 (enqueue) | Drain ≤ 200 мс | **At-most-once** — повторная отправка аудио клиентом при таймауте |
-| **CDN Edge Cache** | TTS аудио + статические ассеты | Распределён по 600+ Edge PoP (~500 ГБ суммарно) | 13 420 / 23 485 | Origin push при деплое / новом TTS | 24 часа (TTS), 7 дней (статика) | **Eventual** — immutable by hash, инвалидация через versioned URL |
+| **Gamification Cache** (`user_gamification_cache`) | Горячие поля: `xp_total`, `gems_balance`, `streak_days`, `hearts` | ~6 ГБ (52,7 млн DAU × 0,1 КБ) | 2 440 / 4 270 | 2 440 / 4 270 (write-through) | 24 часа (+ write-through) | **Strong** — мгновенный отклик при начислении XP / списании жизней |
+| **Leaderboard Cohort Cache** | Актуальный Top-30 для активных когорт лиг (~1,76 млн комнат) | ~5,3 ГБ (1,76 млн комнат × 3 КБ) | 1 220 / 2 135 | Пакетный flush каждые 5–10 с | 10 сек | **Eventual** — амортизирует частые обновления очков пользователей |
+| **User Course Progress Cache** | Денормализованный прогресс активного курса пользователя | ~26 ГБ (52,7 млн DAU × 0,5 КБ активного среза) | 2 440 / 4 270 | 2 440 / 4 270 (write-behind / write-through) | 2 часа | **Strong** — защита от откатов прогресса прохождения |
+| **Course Content Cache** | Сериализованные деревья уроков и упражнений | ~2 ГБ (горячие 20% от 200 ГБ контента) | 2 440 / 4 270 | ~0 (инвалидация при публикации контента) | 1 час (+ invalidate on publish) | **Eventual** — справочный неизменяемый контент |
+| **ML Audio Buffer (Inference)** | Временный буфер аудио в RAM/GPU-очереди до распознавания речи | ~3 ГБ (3 203 RPS × 40 КБ × 30 с окно) | — | 1 830 / 3 203 (enqueue) | Drain ≤ 200 мс | **At-most-once** — 99,5% записей сбрасываются сразу после scoring |
+| **DWH Event Streaming Buffer** | Буфер сообщений (Apache Kafka) перед загрузкой в ClickHouse/DWH | ~2 ГБ (буфер на 15–30 сек потока аналитики) | — | 2 440 / 4 270 | Пакетный сброс (batch 5 с) | **At-least-once** — надежная доставка аналитики и ошибок |
+| **CDN Edge Cache** | Аудиозаписи TTS + статические медиа-ассеты (WebP/SVG) | Распределён по 600+ Edge PoP (~500 ГБ суммарно) | 13 420 / 23 485 | Push при деплое ассетов / генерации TTS | 24 часа (TTS), 7 дней (статика) | **Eventual** — неизменяемы по content hash |
+
+---
+
+## 6. Физическая схема данных
+
+### 6.1 Выбор СУБД по профилю нагрузки
+
+| Группа данных | Профиль нагрузки | Выбранная СУБД | Альтернатива | Архитектурное обоснование выбора |
+|---|---|---|---|---|
+| **users**, **контент курсов** (`courses`, `units`, `lessons`, `exercises`, метаданные TTS/ассетов) | **Read-Heavy / OLTP**:<br>• `users`: Write 2,8 peak RPS, Read 4 270 peak RPS. Объем 300 ГБ.<br>• Контент: 205 ГБ, Read 4 270 peak RPS (90% отсекает L7-кэш). | **PostgreSQL 18** | MySQL 8.4, MongoDB | • Требуется строгая целостность (ACID), уникальность email/username и поддержка `JSONB` с GIN-индексами для синтаксических деревьев заданий.<br>• В PostgreSQL 18 оптимизировано управление соединениями и ускорена работа с JSONB.<br>• **Отказ от шардирования**: 300 ГБ `users` и 205 ГБ контента полностью укладываются в лимит безопасного размера узла (< 1 ТБ) и обслуживаются кластером с репликами. |
+| **user_course_progress**, **user_mistakes**, **speech_samples** | **Write-Heavy / NoSQL**:<br>Запись 4 270 peak RPS, Чтение 4 270 peak RPS. Объем 1,22 ТБ (+3,65 ТБ/год). Доступ строго по `user_id`. | **ScyllaDB 2026** | Apache Cassandra 5.0 | • Запись в LSM-дерево (MemTable $\to$ CommitLog) оптимизирована под частые апдейты без распределенного консенсуса.<br>• **ScyllaDB (C++, Seastar framework)** использует архитектуру **Thread-per-Core (Shared-Nothing)**: каждый поток CPU привязан к ядру и собственному участку памяти.<br>• *В отличие от Cassandra на Java*, отсутствуют паузы сборщика мусора (Stop-the-World GC) и блокировки потоков ОС, гарантируя предсказуемый SLA (p99 $< 5 \text{ мс}$).<br>• Query-first: выборка прогресса за 1 раундтрип по ключу `user_id`. |
+| **user_sessions**, **user_gamification**, **league_cohorts** | **Ultra-Hot In-Memory**:<br>Сессии: 44 835 peak RPS. Геймификация: 4 270 peak RPS. SLA $< 1 \text{ мс}$. | **Redis 8.10 / Valkey 9.1** | Memcached, Tarantool | • Нативные структуры: `STRING` с TTL для сессий, `HASH` (`HINCRBY`) для инкремента XP/стрика без блокировок, `ZSET` для Top-30 лиги за $O(\log N + M)$.<br>• Персистентность: AOF `appendfsync everysec` (потери при аварии $\le 1$ с) + RDB-снапшоты.<br>• Вытеснение: `volatile-lru` для сессий, `noeviction` для геймификации. |
+| **dwh_events** | **Append-Only / OLAP**:<br>4 270 peak RPS (210 млн/сут), объем 19,2 ТБ/год полезных данных. | **ClickHouse 26.9** (+ Kafka) | PostgreSQL, Druid | • Колоночное сжатие (LZ4/ZSTD) уменьшает объем в $4\times$ (19,2 ТБ $\to$ ~4,8 ТБ на диске). Векторный движок (SIMD) ускоряет агрегации продуктовых воронок и Spaced Repetition.<br>• Запись пакетами по 20k–50k строк через топик Kafka исключает фрагментацию партов. |
+| Поиск по каталогу | **Full-Text Search** | **OpenSearch 3.9** | Postgres `tsvector` | • Специализированный Inverted Index (BM25) с нечетким поиском и стеммингом. Изолирует поиск от базы транзакций. |
+| Блобы медиа и речи (`object_storage_*`) | **BLOB Storage**:<br>TTS (0,4 ТБ), графика (0,01 ТБ), речь (2,84 ТБ с TTL 90d). | **SeaweedFS / S3** | NFS, GridFS | • S3 — протокол объектного хранилища, а не база данных. SeaweedFS предоставляет S3-совместимый API «из коробки», без отдельного шлюза. S3 Lifecycle удаляет записи речи через 90 дней. |
+
+---
+
+### 6.2 Физическая структура хранения и индексы
+
+#### Сводная таблица хранения сущностей
+
+| Сущность | Хранилище | Ключ доступа (PK / Shard Key) | Индексы и структуры | Объем данных |
+|---|---|---|---|---|
+| **users** | PostgreSQL 18 (Users DB) | `user_id` (BIGINT, PK) | • B-Tree: `email` (UNIQUE)<br>• B-Tree: `username` (UNIQUE) | ~300 ГБ (600 млн строк) |
+| **courses**, **units**, **lessons** | PostgreSQL 18 (Content DB) | `course_id`, `unit_id`, `lesson_id` (PK) | • B-Tree Composite: `units(course_id, ordinal)`<br>• B-Tree Composite: `lessons(unit_id, ordinal)` | ~155 МБ суммарно |
+| **exercises** | PostgreSQL 18 (Content DB) | `exercise_id` (BIGINT, PK) | • B-Tree: `lesson_id`<br>• GIN-индекс: `metadata` (JSONB) | ~200 ГБ (20 млн строк) |
+| **tts_audio**, **static_assets** | PostgreSQL 18 (Content DB) | `audio_hash` / `asset_hash` (PK) | • B-Tree по PK (SHA256 хеш)<br>• `storage_key` указывает на S3 | ~3 ГБ (метаданные) |
+| **user_course_progress** | ScyllaDB 2026 | Partition Key: `user_id` | • Данные: `active_courses` (JSON текст)<br>• LSM-дерево + Bloom Filter | ~900 ГБ (600 млн строк) |
+| **user_mistakes** | ScyllaDB 2026 | Partition Key: `user_id` | • Данные: `recent_mistakes` (JSON текст)<br>• Compaction: Leveled | ~300 ГБ (600 млн строк) |
+| **speech_samples** | ScyllaDB 2026 | `PRIMARY KEY ((user_id), sample_id)` | • Clustering Key: `sample_id` (DESC)<br>• Нативный TTL: 90 дней (7 776 000 с) | ~14,2 ГБ (71 млн строк) |
+| **user_sessions** | Redis 8.10 Cluster | Key: `sess:{token}` | • Тип: `STRING`, TTL: 30 дней<br>• Hash-доступ $O(1)$ | ~24 ГБ RAM (80 млн токенов) |
+| **user_gamification** | Redis 8.10 Cluster | Key: `user:{id}:gamif` | • Тип: `HASH` (`xp`, `gems`, `streak`, `hearts`)<br>• Атомарный `HINCRBY` | ~6 ГБ RAM (52,7 млн DAU) |
+| **league_cohorts** | Redis 8.10 Cluster | Key: `league:{cohort_id}:board` | • Тип: `ZSET` (`score` = XP, `member` = `user_id`)<br>• Выборка Top-30: $O(\log N + 30)$ | ~5,3 ГБ RAM (1,76 млн комнат) |
+| **dwh_events** | ClickHouse 26.9 | Shard: `user_id`<br>OrderBy: `(event_type, event_date, user_id, event_id)` | • Движок: `ReplicatedMergeTree`<br>• Партиционирование: `toYYYYMM(event_date)`<br>• Типы: `LowCardinality(String)` | 19,2 ТБ/год (raw) $\to$ 4,8 ТБ/год (сжатый) |
+
+#### Индексы и структуры данных
+
+```
+1. B-Tree / B+Tree (Postgres):
+   • Точечный поиск: users(email) -> O(log N)
+   • Диапазоны и сортировка: units(course_id, ordinal) -> Leftmost Prefix Rule (поиск по course_id или course_id+ordinal)
+
+2. Hash Table (Redis):
+   • O(1) поиск по сессионному токену и доступ к полям геймификации
+
+3. Inverted Index (OpenSearch):
+   • Терм -> [DocID_1, DocID_2, ...] с оценкой релевантности BM25 для поиска курсов и упражнений
+
+4. Bloom Filter (ScyllaDB / ClickHouse):
+   • Битовый массив в RAM, отсекающий до 95% холодных обращений к диску для отсутствующих ключей
+```
+
+---
+
+### 6.3 Шардирование и партиционирование
+
+#### 1. Почему PostgreSQL НЕ шардируется
+* Объем таблицы `users`: 600 млн строк $\times 0{,}5 \text{ КБ} = \mathbf{300 \text{ ГБ}}$.
+* Объем таблиц контента (`courses`, `units`, `lessons`, `exercises`): $\mathbf{\sim 205 \text{ ГБ}}$.
+* Нагрузка на запись в `users`: **2,8 peak RPS** (только регистрация/смена пароля).
+* **Архитектурное решение**: Шардирование таблиц размером в 200–300 ГБ с единичной интенсивностью записи — это неоправданный оверинжиниринг. Лимит безопасного размера базы данных на один узел Postgres без деградации VACUUM составляет $\approx 1 \text{ ТБ}$. Данные разделены на два независимых кластера (**Users DB** на 300 ГБ и **Content DB** на 205 ГБ). Каждый кластер состоит из 1 Master + 2 Replicas, а чтение масштабируется репликами и L7-кэшем.
+
+#### 2. Шардирование ScyllaDB 2026 (`user_course_progress`, `user_mistakes`)
+* **Механизм**: Автоматическое распределение по кольцу консистентного хеширования (Consistent Hashing).
+* **Shard Key (Partition Key)**: **`user_id`**.
+* Хеш-функция `Murmur3` отображает `user_id` в пространство токенов ($0 \dots 2^{64}-1$). Каждая физическая нода владеет пулом виртуальных нод (256 vnodes), обеспечивая равномерное распределение 1,22 ТБ данных без перекосов (hot spots).
+
+#### 3. Шардирование Redis 8.10 Cluster
+* Хеш-слоты: 16 384 слота распределены поровну между master-нодами кластера.
+* Привязка ключа: `CRC16(key) mod 16384`. Использование Hash Tags (например, `{user:123}:gamif`) гарантирует локализацию связанных данных одного пользователя в пределах одного слота.
+
+#### 4. Шардирование и партиционирование ClickHouse 26.9
+* **Шардирование**: 2 шарда по 2 реплики (`ReplicatedMergeTree`), запись распределяется по `cityHash64(user_id)`.
+* **Партиционирование**: помесячное `PARTITION BY toYYYYMM(event_date)`. Удаление устаревших данных за пределами retention-окна выполняется мгновенно на уровне метаданных: `ALTER TABLE dwh_events DROP PARTITION '202401'`.
+
+---
+
+### 6.4 Отказоустойчивость, репликация и консистентность
+
+| Хранилище | Модель репликации | Фактор (RF) | Кворум / Консенсус | RPO / RTO | Поведение при отказе узла |
+|---|---|---|---|---|---|
+| **PostgreSQL 18 (Users DB)** | Master + 2 Replicas (1 Sync + 1 Async) | 3 | **Patroni + etcd** (Raft) | $\text{RPO} = 0$<br>$\text{RTO} < 15 \text{ с}$ | Синхронная реплика гарантирует zero data loss. При сбое мастера Patroni автоматически промоутит реплику за $<15$ с. |
+| **PostgreSQL 18 (Content DB)** | 1 Master + 2 Read Replicas | 3 | Patroni + etcd | $\text{RPO} = 0$<br>$\text{RTO} < 15 \text{ с}$ | При аварии мастера чтение продолжается с реплик; промоут резервного мастера занимает $<15$ с. |
+| **ScyllaDB 2026 (Progress)** | Multi-AZ кольцо токенов | $\text{RF} = 3$ | **`LOCAL_QUORUM`** ($W=2, R=2$) | $\text{RPO} = 0$<br>$\text{RTO} = 0 \text{ с}$ | **$R + W > N$ ($2 + 2 = 4 > 3$)** — строгое выполнение кворума. При падении 1 ноды чтение и запись продолжаются без прерывания обслуживания. |
+| **Redis 8.10 Cluster** | Master-Replica per Slot ($N+1$) | 2 (1M + 1R) | Встроенный консенсус нод | $\text{RPO} \le 1 \text{ с}$<br>$\text{RTO} < 3 \text{ с}$ | Реплика автоматически перехватывает слоты мастера за 2–3 секунды. |
+| **ClickHouse 26.9** | 2 шарда $\times$ 2 реплики | 2 | **ClickHouse Keeper** (Raft) | $\text{RPO} \approx 0$<br>$\text{RTO} < 5 \text{ с}$ | Запись буферизуется в Kafka (3 брокера, $RF=3$). Реплики ClickHouse читают из топика независимо. |
+| **SeaweedFS / S3 (Storage)** | Erasure Coding 8+4 | $1{,}5\times$ overhead | Встроенный механизм размещения | $\text{RPO} = 0$<br>$\text{RTO} = 0 \text{ с}$ | Сохраняет доступность при одновременном выходе из строя нескольких volume-нод. |
+
+---
+
+### 6.5 Расчет ресурсов и спецификация оборудования
+
+#### Методика расчета:
+* **Дисковая емкость**: $\text{Disk} = \frac{\text{Raw Data} \times RF \times 1{,}3 \text{ (индексы/WAL)} \times 1{,}3 \text{ (compaction/reserve)}}{0{,}70 \text{ (порог заполнения SSD)}} \approx \text{Raw} \times RF \times 2{,}4$.
+* **RAM**: 100% сессий, геймификации, контента и $\ge 20\%$ активного профиля пользователей в буферном пуле.
+* **CPU / IOPS**: Обработка локального пика ($K_{peak}^{local} = 2{,}8$) с резервированием $N+1$ и утилизацией процессоров в пике не более $40\%$.
+
+#### Спецификация серверного парка баз данных
+
+| Сервисный кластер | Нод | CPU на ноду (всего) | RAM на ноду (всего) | Диски на ноду | Пиковая нагрузка (RPS / IOPS) | Запас емкости и резервирование |
+|---|---|---|---|---|---|---|
+| **PostgreSQL Users DB** | **3** (1M + 2R) | 8 vCPU (24) | 64 ГБ (192 ГБ) | $2 \times 1$ ТБ NVMe RAID-1 | 4 270 Read / 2,8 Write RPS | 300 ГБ данных + 100 ГБ индексов. Working set в RAM. Резерв $N+2$. |
+| **PostgreSQL Content DB** | **3** (1M + 2R) | 8 vCPU (24) | 128 ГБ (384 ГБ) | $2 \times 1$ ТБ NVMe RAID-1 | 4 270 Read RPS (90% отсекает кэш $\to$ 430 RPS) | Весь контент (205 ГБ) помещается в RAM. Резерв $N+2$. |
+| **ScyllaDB Cluster** | **3** (кольцо RF=3) | 16 vCPU (48) | 64 ГБ (192 ГБ) | $2 \times 1{,}92$ ТБ NVMe (Direct I/O) | 4 270 Read + 4 270 Write RPS ($\approx 17\text{k}$ ops/s с кворумом) | Суммарно 11,5 ТБ NVMe (требуется 7,8 ТБ). Кластер тянет $>180\text{k}$ IOPS. Пик CPU $< 15\%$. Резерв: выдерживает потерю 1 ноды. |
+| **Redis Cluster** | **6** (3M + 3R) | 4 vCPU (24) | 16 ГБ (96 ГБ) | 100 ГБ SSD (AOF/RDB) | 44 835 Read / 4 270 Write RPS ($\approx 15\text{k}$ RPS на master) | 35,3 ГБ данных в 96 ГБ RAM. 1 инстанс держит до 60k RPS. Резерв $N+1$. |
+| **ClickHouse Cluster** | **4** (2 шарда $\times$ 2R) | 16 vCPU (64) | 64 ГБ (256 ГБ) | $2 \times 3{,}84$ ТБ NVMe RAID-1 | 4 270 RPS (пакетный flush из Kafka по 20k–50k строк) | 15,3 ТБ полезного места хватает на >2 года аналитики сжатием $4\times$. |
+| **OpenSearch Cluster** | **3** (Master/Data) | 8 vCPU (24) | 32 ГБ (96 ГБ) | 500 ГБ NVMe | 2 135 Search RPS | Индекс (50 ГБ) в системном дисковом кэше. Резерв $N+1$. |
+| **ИТОГО** | **22 ноды** | **208 vCPU** | **1 216 ГБ RAM** | **~32 ТБ NVMe/SSD** | **Пик: 44,8k RPS** | **Отказоустойчивость: N+1 / N+2 на всех уровнях** |
+
+---
+
+### 6.6 Пороги масштабирования
+
+| Слой / Хранилище | Текущее значение | Триггер | Следующий шаг |
+|---|---|---|---|
+| **PostgreSQL Users DB** | 300 ГБ | > 700 ГБ | Вертикальный апгрейд → read-реплика → шардирование через Citus по `user_id` |
+| **PostgreSQL Content DB** | 200 ГБ | > 600 ГБ | Вынос `content_tree` / `correct_answers` в document store (ScyllaDB / MongoDB) |
+| **ScyllaDB** | 1,22 ТБ / 3 ноды | > 2 ТБ на ноду | Добавить 3 ноды (RF=3 сохраняется, vnodes перебалансируют данные автоматически) |
+| **Redis Cluster** | 35,3 ГБ / 3 master | > 60 ГБ | Добавить master-pair; «холодных» пользователей (>30 дней) вытеснять в ScyllaDB |
+| **ClickHouse dwh_events** | ~4,8 ТБ/год (сжатый) | > 10 ТБ на шард | Добавить 3-й шард; установить `TTL event_date + INTERVAL 2 YEAR`; агрегировать в materialized view |
+| **SeaweedFS / S3 (объектное)** | ~3,25 ТБ | > 80% ёмкости | Добавить volume-сервера; TTS и статика не растут критично — основной рост от сэмплов речи при росте DAU |
+| **L7-балансировщики** | 33–36% CPU в пике | > 60% CPU устойчиво | ASG поднимает дополнительную ноду; при x2 DAU увеличить baseline с `N+1` до `N+2` |
+
+---
+
+## 7. Описание алгоритмов функционирования блоков системы
+
+В разделе приведено описание двух ключевых алгоритмов системы, архитектура и способ реализации которых оказывают определяющее влияние на профиль нагрузки вычислительных узлов, физическую структуру хранения данных и сквозную задержку (SLA):
+1. **Half-Life Regression (HLR)** — адаптивное интервальное повторение в условиях нагрузки $>300$ млн прогнозов в сутки;
+2. **Conformer-CTC + Goodness of Pronunciation (GoP)** — потоковый конвейер оценки устной речи на GPU с жестким ограничением по времени (SLA $< 200$ мс) и фильтрацией 99,5% медиапотока.
+
+---
+
+### 7.1 Адаптивное интервальное повторение на базе Half-Life Regression (HLR)
+
+* **Наименование алгоритма**: Half-Life Regression (HLR) для моделирования динамики забывания информации.
+* **Блок системы**: Подсистема адаптивного обучения и генерации уроков (*Practice Hub / Adaptive Learning Engine*).
+* **Постановка задачи**: Прогнозирование вероятности успешного вспоминания $p$ изученной лексемы через интервал $\Delta t$ после последнего повторения и ранжирование упражнений с целью удержания сложности в оптимуме ($p \in [0{,}75; 0{,}85]$).
+* **Исходные данные и ограничения**:
+  * *Вход*: `user_id`, история повторений лексемы (число успехов $n^+$, ошибок $n^-$, прошедшее время $\Delta t$), лингвистические параметры слова (длина, часть речи).
+  * *Ограничения*: онлайн-инференс формирования урока $\le 25$ мс (p99); объем инференса $>300$ млн вызовов/сутки; пиковый RPS на сервис повторения — 1 068 RPS.
+  * *Результат*: отранжированный список из 10–15 упражнений.
+* **Последовательность работы алгоритма (Offline + Online)**:
+  * *Математическая модель*: Закон Эббингауза $p = 2^{-\frac{\Delta t}{h}}$, где период полураспада памяти $h$ моделируется регрессией $\log_2 h = \boldsymbol{\theta}^T \mathbf{x} = \sum w_i x_i + b$.
+  * *Оффлайн-контур*:
+    1. ClickHouse (`dwh_events`): сбор лога попыток (210 млн записей/сутки);
+    2. Раз в сутки Spark/PyTorch переобучает вектор весов $\boldsymbol{\theta}$ минимизацией MSE с $L_2$-регуляризацией;
+    3. Веса $\boldsymbol{\theta}$ экспортируются в Feature Store (Redis/ScyllaDB).
+  * *Онлайн-контур*:
+    1. Запрос `GET /api/v1/review/mistakes` $\to$ из ScyllaDB (`user_mistakes`) за 1 раундтрип ($<2$ мс) извлекаются до 100 проблемных лексем пользователя;
+    2. Вычисление $h = 2^{\boldsymbol{\theta}^T \mathbf{x}}$ и $p = 2^{-\Delta t / h}$ на CPU воркера через SIMD/AVX2 ($\approx 1{,}2$ мс на весь пул кандидатов);
+    3. Фильтрация: отсечение $p > 0{,}92$ (слишком просто) и $p < 0{,}40$ (требует повтора теории);
+    4. Top-K отбор через ограниченную кучу (Min-Heap) 12 заданий с минимальным $|p - 0{,}80|$.
+* **Используемые структуры данных**:
+  * Вектор признаков контакта $\mathbf{x} \in \mathbb{R}^D$ (Sparse Float32);
+  * Денормализованный JSONB-документ `user_mistakes` в ScyllaDB по ключу `user_id`;
+  * Min-Heap (очередь с приоритетом) на 15 элементов для онлайн-ранжирования.
+* **Рассматриваемые альтернативы**:
+  * *Алгоритм Leitner / SM-2 (Anki)*: дискретные фиксированные интервалы, эвристические коэффициенты, нет учета контекста и морфологии;
+  * *Deep Knowledge Tracing (DKT на LSTM/Transformers)*: высокая точность, но неприемлемая вычислительная сложность $O(L \cdot d^2)$ на GPU при 300+ млн запросов в сутки;
+  * *Выбранный HLR*: баланс между учетом психометрической кривой памяти и скоростью линейной регрессии ($O(d)$ на CPU, $<2$ мс).
+* **Обоснование выбора**: HLR вычисляется элементарными операциями на CPU серверов приложений, не требует GPU для онлайна и обеспечивает детерминированный SLA $< 25$ мс при нулевых затратах на специализированное железо.
+* **Влияние на архитектуру и БД**:
+  * Определило денормализацию `user_mistakes` в ScyllaDB (1 строка на пользователя вместо 30 млрд строк $User \times Lexeme$);
+  * Изоляция: модель учится оффлайн на ClickHouse, онлайн-инференс не создает блокировок и очередей в транзакционной базе.
+
+---
+
+### 7.2 Конвейер потоковой оценки произношения (Speech Scoring Pipeline)
+
+* **Наименование алгоритма**: Потоковый акустико-фонетический скоринг с метрикой Goodness of Pronunciation (GoP) на базе Conformer-CTC и Forced Alignment.
+* **Блок системы**: Сервис верификации речи (*Speech Verification Service*, эндпоинт `speech.duolingo.com`).
+* **Постановка задачи**: Проверка произношения фразы пользователем в реальном времени с выявлением ошибок на уровне конкретных фонем и слов при жестком ограничении задержки.
+* **Исходные данные и ограничения**:
+  * *Вход*: аудиопоток пользователя (40 КБ, Opus 16 кГц, длительность 3–4 с), `exercise_id`, эталонная фраза.
+  * *Ограничения*: сквозная задержка (End-to-End Latency) $\le 200$ мс; пиковая нагрузка — 3 203 RPS (до 5 124 RPS в локальных пиках); входящий поток — до 1 025 Мбит/с.
+  * *Результат*: `pronunciation_score` $\in [0{,}0; 1{,}0]$, флаг зачета и пословная разметка искаженных фонем.
+* **Последовательность работы алгоритма (Offline + Online)**:
+  * *Оффлайн-контур*:
+    1. Построение G2P-словаря (Grapheme-to-Phoneme) канонических цепочек фонем для всех предложений курса;
+    2. Обучение компактной модели Conformer-CTC (30 млн параметров) на многоязычном корпусе;
+    3. Экспорт графа в NVIDIA TensorRT (FP16) для инференса на GPU EC2 P3/G5.
+  * *Онлайн-контур*:
+    1. Прием запроса на `speech.duolingo.com` $\to$ прямой роутинг на GPU-ноду;
+    2. In-memory декомпрессия `libopus` в 16-bit Linear PCM ($\approx 2$ мс);
+    3. Расчет 80-полосной лог-мел спектрограммы ($\approx 3$ мс);
+    4. Прямой проход Conformer-CTC на TensorRT GPU $\to$ решетка апостериорных вероятностей фонем $P(\pi_t | \mathbf{x})$ ($\approx 65$ мс);
+    5. Принудительное выравнивание (Forced Alignment) алгоритмом Витерби по эталонной цепочке фонем с фиксацией временных границ $[t_s, t_e]$ ($\approx 12$ мс);
+    6. Расчет метрики GoP для каждой фонемы:
+       $$GoP(p) = \frac{1}{t_e - t_s + 1} \sum_{t=t_s}^{t_e} \log \frac{P(p | \mathbf{x}_t)}{\max_{q} P(q | \mathbf{x}_t)}$$
+    7. Агрегация в пословные и интегральную оценку ($\approx 3$ мс);
+    8. *Управление хранением*: генератор случайных чисел отбирает 0,5% сэмплов ($\approx 9$ RPS) и асинхронно отправляет в Kafka для записи в S3 (`object_storage_user_speech`, TTL 90 дней) и ScyllaDB (`speech_samples`). Остальные 99,5% аудиоданных немедленно уничтожаются в RAM.
+* **Используемые структуры данных**:
+  * Кольцевой буфер (Ring Buffer) в RAM для декомпрессии аудио без системных аллокаций;
+  * Тензор спектральных признаков $\mathbf{X} \in \mathbb{R}^{T \times 80}$;
+  * CTC-матрица апостериорных вероятностей $T \times |\mathcal{P}|$ ($|\mathcal{P}| \approx 40 \dots 60$ фонем);
+  * Префиксное дерево (Trie) фонетического словаря.
+* **Рассматриваемые альтернативы**:
+  * *Внешние облачные ASR API (Google / AWS Transcribe)*: неприемлемая стоимость ($> \$950\,000$/мес при 1 830 avg RPS), непредсказуемый RTT (600–1500 мс), отсутствие пофонемного GoP;
+  * *Авторегрессионные модели E2E (Whisper)*: авторегрессионный декодер тратит 250–500 мс на пошаговую генерацию токенов текста, что избыточно, так как целевой текст заранее известен;
+  * *Выбранный Conformer-CTC + GoP*: отсутствие декодера обеспечивает параллельный проход по тензору за один шаг на GPU ($\le 65$ мс) с прямым расчетом вероятности конкретной фонемы.
+* **Обоснование выбора**: Conformer-CTC дает минимальный инференс-тайм на GPU ($<70$ мс), а формула GoP математически строго измеряет отклонение произношения от акустического эталона без генерации лишнего текста.
+* **Влияние на архитектуру и БД**:
+  * Выделение отдельного домена `speech.duolingo.com` изолирует поток 1 Гбит/с от Core API;
+  * Фильтрация 99,5% записей в памяти снижает нагрузку на запись в S3 с 1 830 RPS до **9 RPS**, стабилизируя объем хранилища речи на отметке 2,84 ТБ вместо 568 ТБ/год;
+  * Таблица `speech_samples` в ScyllaDB хранит только метаданные отобранных сэмплов с нативным TTL 90 дней.
 
 ---
 

@@ -694,7 +694,7 @@ erDiagram
 | **user_course_progress**, **user_mistakes**, **speech_samples** | **Write-Heavy / NoSQL**:<br>Запись 4 270 peak RPS, Чтение 4 270 peak RPS. Объем 1,22 ТБ (+3,65 ТБ/год). Доступ строго по `user_id`. | **ScyllaDB 2026** | Apache Cassandra 5.0 | • Запись в LSM-дерево (MemTable $\to$ CommitLog) оптимизирована под частые апдейты без распределенного консенсуса.<br>• **ScyllaDB (C++, Seastar framework)** использует архитектуру **Thread-per-Core (Shared-Nothing)**: каждый поток CPU привязан к ядру и собственному участку памяти.<br>• *В отличие от Cassandra на Java*, отсутствуют паузы сборщика мусора (Stop-the-World GC) и блокировки потоков ОС, гарантируя предсказуемый SLA (p99 $< 5 \text{ мс}$).<br>• Query-first: выборка прогресса за 1 раундтрип по ключу `user_id`. |
 | **user_sessions**, **user_gamification**, **league_cohorts** | **Ultra-Hot In-Memory**:<br>Сессии: 44 835 peak RPS. Геймификация: 4 270 peak RPS. SLA $< 1 \text{ мс}$. | **Redis 8.10 / Valkey 9.1** | Memcached, Tarantool | • Нативные структуры: `STRING` с TTL для сессий, `HASH` (`HINCRBY`) для инкремента XP/стрика без блокировок, `ZSET` для Top-30 лиги за $O(\log N + M)$.<br>• Персистентность: AOF `appendfsync everysec` (потери при аварии $\le 1$ с) + RDB-снапшоты.<br>• Вытеснение: `volatile-lru` для сессий, `noeviction` для геймификации. |
 | **dwh_events** | **Append-Only / OLAP**:<br>4 270 peak RPS (210 млн/сут), объем 19,2 ТБ/год полезных данных. | **ClickHouse 26.9** (+ Kafka) | PostgreSQL, Druid | • Колоночное сжатие (LZ4/ZSTD) уменьшает объем в $4\times$ (19,2 ТБ $\to$ ~4,8 ТБ на диске). Векторный движок (SIMD) ускоряет агрегации продуктовых воронок и Spaced Repetition.<br>• Запись пакетами по 20k–50k строк через топик Kafka исключает фрагментацию партов. |
-| Поиск по каталогу | **Full-Text Search** | **OpenSearch 3.9** | Postgres `tsvector` | • Специализированный Inverted Index (BM25) с нечетким поиском и стеммингом. Изолирует поиск от базы транзакций. |
+| **courses_search_index** (поиск по каталогу: `courses`, `units`) | **Full-Text Search**:<br>Read 2 135 peak RPS. Объем индекса ~50 ГБ. | **OpenSearch 3.9** | Postgres `tsvector` | • Специализированный Inverted Index (BM25) с нечетким поиском и стеммингом. Изолирует поиск от базы транзакций. |
 | Блобы медиа и речи (`object_storage_*`) | **BLOB Storage**:<br>TTS (0,4 ТБ), графика (0,01 ТБ), речь (2,84 ТБ с TTL 90d). | **SeaweedFS / S3** | NFS, GridFS | • S3 — протокол объектного хранилища, а не база данных. SeaweedFS предоставляет S3-совместимый API «из коробки», без отдельного шлюза. S3 Lifecycle удаляет записи речи через 90 дней. |
 
 ---
@@ -716,6 +716,7 @@ erDiagram
 | **user_gamification** | Redis 8.10 Cluster | Key: `user:{id}:gamif` | • Тип: `HASH` (`xp`, `gems`, `streak`, `hearts`)<br>• Атомарный `HINCRBY` | ~6 ГБ RAM (52,7 млн DAU) |
 | **league_cohorts** | Redis 8.10 Cluster | Key: `league:{cohort_id}:board` | • Тип: `ZSET` (`score` = XP, `member` = `user_id`)<br>• Выборка Top-30: $O(\log N + 30)$ | ~5,3 ГБ RAM (1,76 млн комнат) |
 | **dwh_events** | ClickHouse 26.9 | Shard: `user_id`<br>OrderBy: `(event_type, event_date, user_id, event_id)` | • Движок: `ReplicatedMergeTree`<br>• Партиционирование: `toYYYYMM(event_date)`<br>• Типы: `LowCardinality(String)` | 19,2 ТБ/год (raw) $\to$ 4,8 ТБ/год (сжатый) |
+| **courses_search_index** | OpenSearch 3.9 | Index Doc ID: `course_id` | • Inverted Index (BM25), n-gram, fuzzy search<br>• Денормализованный документ: `courses`, `units` | ~50 ГБ (с репликами) |
 
 #### Индексы и структуры данных
 
@@ -834,7 +835,12 @@ erDiagram
     1. Запрос `GET /api/v1/review/mistakes` $\to$ из ScyllaDB (`user_mistakes`) за 1 раундтрип ($<2$ мс) извлекаются до 100 проблемных лексем пользователя;
     2. Вычисление $h = 2^{\boldsymbol{\theta}^T \mathbf{x}}$ и $p = 2^{-\Delta t / h}$ на CPU воркера через SIMD/AVX2 ($\approx 1{,}2$ мс на весь пул кандидатов);
     3. Фильтрация: отсечение $p > 0{,}92$ (слишком просто) и $p < 0{,}40$ (требует повтора теории);
-    4. Top-K отбор через ограниченную кучу (Min-Heap) 12 заданий с минимальным $|p - 0{,}80|$.
+    4. Top-K отбор 12 заданий через ограниченную кучу (Min-Heap) по функции асимметричного штрафа (Two-Piece Normalized Loss):
+       $$L(p) = \begin{cases} 
+       \left(\dfrac{0{,}80 - p}{0{,}40}\right)^2, & p \le 0{,}80 \quad (\text{риск забывания}) \\[6pt]
+       \left(\dfrac{p - 0{,}80}{0{,}12}\right)^2, & p > 0{,}80 \quad (\text{переобучение / потеря времени})
+       \end{cases}$$
+       *Обоснование асимметрии*: окно $[0{,}40; 0{,}92]$ несимметрично относительно оптимума $p^* = 0{,}80$ (левое плечо $\Delta_L = 0{,}40$, правое $\Delta_R = 0{,}12$). Симметричная метрика $|p - 0{,}80|$ приводила к «голоданию» (starvation) слов с $p \in [0{,}40; 0{,}68)$ (отклонение $> 0{,}12$) — они вытеснялись почти освоенными словами ($p \approx 0{,}90$). Нормирование по ширине плеча дает $L(0{,}40) = L(0{,}92) = 1{,}0$ и крутизну штрафа справа в $\approx 11{,}1$ раз выше, гарантируя приоритет актуальным словам на грани забывания.
 * **Используемые структуры данных**:
   * Вектор признаков контакта $\mathbf{x} \in \mathbb{R}^D$ (Sparse Float32);
   * Денормализованный JSONB-документ `user_mistakes` в ScyllaDB по ключу `user_id`;

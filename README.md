@@ -897,6 +897,195 @@ erDiagram
 
 ---
 
+## 8. Технологический стек проекта
+
+| Категория / Домен | Назначение / решаемая проблема | Выбранная технология | Альтернативы | Обоснование выбора |
+|---|---|---|---|---|
+| **Клиент: Mobile** | Единая бизнес-логика (офлайн-кэш, расчет стрика, HLR-модель клиента), нативный UI и работа с микрофоном/аудио. | **Kotlin Multiplatform (KMP) + Jetpack Compose / Swift UI** | React Native, Flutter | Нативный доступ к аудио-буферам AudioRecord/AVAudioEngine без оверхеда JS/JNI-моста и лагов GC; 120 FPS анимации в геймификации. |
+| **Клиент: Web** | Клиентский интерфейс для веб-пользователей с богатым интерактивным UI уроков. | **TypeScript + React** | Vue.js, Svelte | Зрелая компонентная экосистема, широкий выбор готовых библиотек интерактивного UI и анимаций, упрощенный наем фронтенд-инженеров. |
+| **Бэкенд: Core Services** | Stateless микросервисы API (Gateway, Progress, Gamification, Sessions, Content). | **Go (Golang)** | Java (Spring Boot), C++ | Высокая плотность горутин при минимальном потреблении памяти (~25 МБ на инстанс против ~500 МБ в Spring); низкие субмиллисекундные паузы GC; быстрый запуск подов. |
+| **Бэкенд: ML Speech Inference** | Высокопроизводительный конвейер кроссплатформенного инференса Conformer-CTC и расчета GoP. | **ONNX Runtime (C++ API + CUDA/TensorRT Provider)** | Triton Inference Server, LibTorch, PyTorch | Оптимизированный мультипровайдерный движок инференса графов; ускорение через CUDA/TensorRT Execution Provider; низкие задержки execution без оверхеда Python GIL. |
+| **Балансировка: L4 (Network)** | Отказоустойчивый распределитель входящего TCP-трафика по пулу L7-прокси. | **IPVS (LVS) в режиме Direct Routing (DR) + keepalived** | AWS NLB, HAProxy | Производительность $>2$ млн пак/с на ноду при нулевых затратах CPU за счет возврата трафика от L7 напрямую клиенту мимо L4 (DSR). |
+| **Балансировка: L7 & Ingress** | TLS-терминация и Ingress; Service Mesh сайдкары и East-West балансировка. | **Nginx + Envoy Proxy** | Traefik, HAProxy, AWS ALB | Nginx держит 9 600 HTTPS RPS на ноду (8 vCPU) с аппаратным TLS; Envoy обеспечивает Outlier Detection, circuit breaker и сбор L7-метрик без правки кода сервисов. |
+| **Брокер сообщений** | Надежная асинхронная шина событий (аналитика DWH, 0.5% сэмплов речи, сброс сессий). | **Apache Kafka (KRaft)** | RabbitMQ, NATS JetStream | Гарантированный Append-Only лог на диске; линейный скейлинг партиций; высокая пропускная способность при батчинге аналитики (4 270+ msg/s). |
+| **OLTP СУБД: Users & Content** | Хранение профилей пользователей, курсов, уроков и метаданных упражнений. | **PostgreSQL** | MySQL, MongoDB | Поддержка строгой ACID-изоляции, эффективный JSONB с GIN-индексами для деревьев грамматики; 1 узел Postgres покрывает 300 ГБ `users` без шардирования. |
+| **NoSQL СУБД: Progress & Mistakes** | Хранение пользовательского прогресса, персональных ошибок HLR и метаданных речи. | **ScyllaDB** | Apache Cassandra, DynamoDB | Архитектура Seastar Thread-per-Core (C++) без JVM GC-пауз; предсказуемый SLA чтения/записи (p99 $< 5$ мс) по ключу `user_id` при 4 270+ RPS. |
+| **In-Memory Cache & Gamification** | Хранение сессий, атомарный инкремент геймификации (`HINCRBY`) и лидерборды лиг (`ZSET`). | **Redis Cluster** | KeyDB, Tarantool, Memcached | Нативные структуры данных под задачи геймификации; субмиллисекундный доступ для 44k RPS сессий; развитый механизм AOF + репликация. |
+| **OLAP СУБД: Analytics & Spaced Repetition** | Аналитическое хранилище DWH для продуктовых воронок и датасетов переобучения HLR. | **ClickHouse** | Apache Druid, StarRocks, Postgres | Векторный SIMD-движок и сжатие LZ4/ZSTD (сжатие 19,2 ТБ/год до ~4,8 ТБ); агрегации сотен миллионов строк за доли секунды. |
+| **Полнотекстовый поиск** | Поиск по каталогу 280+ курсов, языковых юнитов и справочных материалов. | **OpenSearch** | Elasticsearch, Postgres tsvector | Инвертированный индекс BM25 с n-gram и стеммингом; полная изоляция поисковой нагрузки от реляционной базы PostgreSQL. |
+| **Объектное хранилище (BLOB)** | Хранение синтезированного TTS-аудио, спрайтов и валидационных записей речи. | **SeaweedFS / AWS S3** | Ceph, MinIO, GridFS | Нативная совместимость с S3 API; SeaweedFS эффективен для миллиардов мелких аудиофайлов (~20–40 КБ) за счет хранения чанков в общем Volume-файле без inode-оверхеда. |
+| **Orchestration & Compute** | Управление жизненным циклом stateless-контейнеров, автоскейлинг HPA и KEDA. | **Kubernetes (EKS / Bare-Metal)** | Nomad, Docker Swarm | Мировой стандарт оркестрации; декларативное управление; развитый экосистемный стек (HPA по кастомным метрикам Prometheus, GPU Operator). |
+| **Infrastructure as Code (IaC)** | Декларативное описание мультирегиональной облачной инфраструктуры (VPC, EKS, L4/L7, RDS). | **OpenTofu / Terraform** | Pulumi, CloudFormation | Открытый форк с лицензией MPL 2.0; зрелые провайдеры под AWS/Bare-Metal; защита от вендор-лока. |
+| **Конфигурация хостов** | Начальная подготовка L4-нод, настройка параметров ядра Linux (sysctl, network tuning). | **Ansible** | Puppet, SaltStack | Агентлес-архитектура по SSH; простота запуска плейбуков без необходимости постоянного мастер-демона. |
+| **CI/CD & GitOps** | Непрерывная сборка образов (CI) и декларативная синхронизация состояния кластера из Git (CD). | **GitLab CI + ArgoCD** | GitHub Actions + Flux | Двухконтурный GitOps: GitLab CI изолирован на сборке/тестах артефактов; ArgoCD тянет манифесты через Pull-модель, исключая передачу секретов кластера наружу. |
+| **Доставка метрик (Push/Pull)** | Сбор метрик с подов по pull-модели (scraping), локальная буферизация в памяти и сброс батчами. | **OpenTelemetry Collector + Prometheus Agent** | Telegraf, DataDog Agent | Устраняет сетевой оверхед прямого пуша метрик от сервисов; единый открытый вендор-нейтральный протокол OTLP. |
+| **Хранилище метрик (TSDB)** | Долговременное компактное хранение системных и бизнесовых метрик. | **VictoriaMetrics Cluster** | Встроенный Prometheus TSDB, Thanos | В 5–7 раз компактнее Prometheus TSDB; низкое потребление RAM; горизонтальное масштабирование раздельных компонентов (vmstorage, vminsert, vmselect). |
+| **Доставка логов (Agent)** | Сбор логов stdout/stderr контейнеров с нод (DaemonSet), буферизация на диске и фильтрация. | **Vector (Datadog)** | Fluentbit, Promtail | Написан на Rust; минимальное потребление CPU/RAM; гарантированная защита от OOM и дисковый буфер при недоступности приемника логов. |
+| **Хранилище логов** | Централизованное хранилище структурированных логов. | **Grafana Loki** | Elasticsearch, OpenSearch | Индексирует только метаданные (лейблы стримов), а само тело лога сжимает в чанки; экономия дискового пространства в разы по сравнению с ELK. |
+| **Распределенная трассировка** | Сквозной трейсинг запросов от Ingress до БД для отслеживания p99 задержек. | **OpenTelemetry SDK + Grafana Tempo** | Jaeger, Zipkin | Хранит трейсы в объектном хранилище S3 без использования дорогой памяти и тяжелых индексов; нативная интеграция со связкой Grafana/Loki. |
+| **Визуализация и алертинг** | Единые дашборды мониторинга (метрики, логи, трейсы) и отправка алертов дежурным. | **Grafana** | Kibana, Datadog | Единое окно наблюдаемости (Single Pane of Glass); интеграция с VictoriaMetrics, Loki и Tempo; гибкий Alertmanager. |
+| **Безопасность и WAF** | Trivy — сканирование уязвимостей в CI; Coraza/AWS WAF — инспекция L7 на ботнет и DDoS. | **Trivy + AWS WAF / Coraza WAF** | Clair, ModSecurity | Trivy выявляет CVE в библиотеках и Docker-слоях до деплоя; WAF защищает публичные ручки `/api/auth` и `/api/lessons` от брутфорса и scrapers. |
+| **Нагрузочное тестирование** | Проверка пропускной способности сервисов и сценариев прохождения уроков под нагрузкой. | **k6** | JMeter, Locust, Yandex Tank | Сценарии описываются на JS/TypeScript; высокоэффективный Go-рантайм генерирует десятки тысяч RPS с одного генератора без JVM-накладных расходов. |
+
+---
+
+## 10. Архитектурная схема проекта
+
+### 10.1 Архитектурная диаграмма системы
+
+```mermaid
+flowchart TD
+    %% 1. Клиенты, DNS и CDN
+    subgraph S_EDGE["1. Клиенты, DNS и CDN"]
+        Mobile["Мобильное приложение (iOS / Android)"]
+        Web["Веб-приложение (React SPA)"]
+        R53["Amazon Route 53 (DNS)"]
+        CDN["Edge PoP CDN (CloudFront)"]
+    end
+
+    %% 2. Входной периметр
+    subgraph S_INGRESS["2. Входной периметр и Gateway"]
+        L4["L4 Balancer: IPVS (DR mode)"]
+        L7["L7 Ingress: Nginx (TLS / WAF)"]
+        APIGW["API Gateway (BFF Go)"]
+    end
+
+    %% 3. Вычислительный контур (K8s)
+    subgraph S_APP["3. Вычислительный контур (Kubernetes EKS)"]
+        subgraph S_ML["GPU ML Cluster"]
+            SpeechSvc["Speech Verification (ONNX Runtime)"]
+        end
+        subgraph S_CORE["Stateless Core Services"]
+            AuthSvc["Auth & Users"]
+            ProgressSvc["Progress & Practice (HLR)"]
+            GamifSvc["Gamification & Leagues"]
+            ContentSvc["Course Content Catalog"]
+        end
+        subgraph S_ASYNC["Фоновые воркеры"]
+            SpeechArchiver["Speech S3 Archiver"]
+            DWHConsumer["Kafka-to-ClickHouse Consumer"]
+            LeagueWorker["League Leaderboard Finalizer"]
+            HLRTrainer["HLR Model Trainer"]
+        end
+    end
+
+    %% 4. Очереди и брокеры
+    subgraph S_QUEUE["4. Событийная шина"]
+        Kafka["Apache Kafka Cluster"]
+    end
+
+    %% 5. Хранилища данных
+    subgraph S_DATA["5. Хранилища данных (Базы, Кэши, S3)"]
+        S3Storage[("SeaweedFS / S3 Storage")]
+        PostgresUsers[("PostgreSQL: Users DB")]
+        RedisCluster[("Redis Cluster")]
+        Scylla[("ScyllaDB Cluster")]
+        PostgresContent[("PostgreSQL: Content DB")]
+        OpenSearch[("OpenSearch Cluster")]
+        ClickHouse[("ClickHouse Cluster")]
+    end
+
+    %% 6. Наблюдаемость
+    subgraph S_OBS["6. Контур наблюдаемости"]
+        OtelAgent["OTel Collector & Vector (DaemonSet)"]
+        VicMetrics["VictoriaMetrics (Метрики)"]
+        Loki["Grafana Loki (Логи)"]
+        Tempo["Grafana Tempo (Трейсы)"]
+        GrafanaUI["Grafana (Дашборды и Алерты)"]
+    end
+
+    %% Клиентский трафик
+    Mobile --> R53
+    Web --> R53
+    Mobile --> CDN
+    Web --> CDN
+    Mobile --> L4
+    Web --> L4
+    CDN -.-> L4
+
+    %% Входной трафик в ЦОД
+    L4 --> L7
+    L7 --> APIGW
+    L7 --> SpeechSvc
+
+    %% Синхронный RPC от Gateway
+    APIGW --> AuthSvc
+    APIGW --> ProgressSvc
+    APIGW --> GamifSvc
+    APIGW --> ContentSvc
+
+    %% Обращения Core в базы
+    AuthSvc --> PostgresUsers
+    AuthSvc --> RedisCluster
+    ProgressSvc --> Scylla
+    GamifSvc --> RedisCluster
+    ContentSvc --> PostgresContent
+    ContentSvc --> OpenSearch
+
+    %% Асинхронные события в брокер
+    ProgressSvc --> Kafka
+    SpeechSvc --> Kafka
+
+    %% Вычитка воркерами из брокера
+    Kafka --> DWHConsumer
+    Kafka --> SpeechArchiver
+
+    %% Запись воркеров в базы
+    SpeechArchiver --> S3Storage
+    SpeechArchiver --> Scylla
+    DWHConsumer --> ClickHouse
+    LeagueWorker --> RedisCluster
+    HLRTrainer --> ClickHouse
+    HLRTrainer -.-> ProgressSvc
+
+    %% Сбор телеметрии
+    S_APP -.-> OtelAgent
+    OtelAgent --> VicMetrics
+    OtelAgent --> Loki
+    OtelAgent --> Tempo
+    VicMetrics --> GrafanaUI
+    Loki --> GrafanaUI
+    Tempo --> GrafanaUI
+```
+
+---
+
+### 10.2 Описание компонентов и сетевых протоколов взаимодействия
+
+#### 1. Клиенты, Edge и сетевой периметр (Ingress Layer)
+* **Mobile / Web Clients $\to$ Amazon Route 53**: разрешение доменных имен (`api.duolingo.com`, `speech.duolingo.com`, `cdn.duolingo.com`) через Latency-based и Geolocation DNS-политики с поддержкой EDNS Client Subnet (ECS, RFC 7871).
+* **Clients $\to$ Edge PoP CDN (AWS CloudFront)**: протоколы **HTTPS (HTTP/2, HTTP/3 QUIC)**. Кэширование статических изображений и pre-rendered аудиофрагментов TTS (Opus mono, ~20 КБ). Снижает обращение к Origin-серверам на 90%.
+* **Clients $\to$ L4 Балансировщики (IPVS + keepalived)**: протоколы **TCP/TLS** на порты 443 и 8443. L4 работает в режиме Direct Routing (DR / DSR): пакеты передаются на L7 с сохранением клиентского IP, а обратный ответ L7-ноды направляют клиентам напрямую в интернет через шлюз, минуя L4.
+* **L4 $\to$ L7 Ingress (Nginx 1.27)**: Nginx производит терминацию TLS, валидацию базовых WAF-правил (Coraza/AWS WAF) и маршрутизирует трафик в кластер Kubernetes по долгоживущим HTTP/2 keep-alive пулам соединений.
+
+#### 2. Микросервисный контур (Service Mesh & Core Services)
+* **L7 Ingress $\to$ API Gateway & Speech Service**: HTTP/2 трафик разделяется по доменным префиксам:
+  * `/speech/*` (домен `speech.duolingo.com`) уходит напрямую на высокопроизводительный **Speech Verification Service** на GPU-нодах (EC2 G5), изолируя тяжелый поток (1 Гбит/с) от бизнес-логики.
+  * `/api/*` уходит на **API Gateway (BFF)**.
+* **API Gateway $\to$ Stateless Core Services**: синхронное межсервисное взаимодействие по протоколу **gRPC (HTTP/2 + Protobuf)** через Envoy Service Mesh:
+  * **Auth & Users Service**: авторизация, проверка токенов сессий, управление профилем.
+  * **Progress & Practice Service**: расчет адаптивных уроков; выполняет онлайн-инференс алгоритма HLR (Half-Life Regression) на CPU за $<2$ мс.
+  * **Gamification & League Service**: начисление XP, алмазов, расчет стриков и еженедельных когорт лиг.
+  * **Course Content Catalog Service**: каталог курсов, грамматических юнитов и упражнений.
+
+#### 3. Взаимодействие с базами данных и брокерами
+* **PostgreSQL 18 (Users DB & Content DB)**: бинарный PostgreSQL wire protocol через пул соединений (pgxpool) с разделением путей Read/Write (чтение с локальных Standby-реплик).
+* **Redis 8.10 Cluster**: протокол **RESP (REdis Serialization Protocol)**. Сессии проверяются за $<1$ мс ($O(1)$). Начисление XP выполняется атомарными командами `HINCRBY`. Лидерборды комнат по 30 человек рассчитываются через `ZADD` и `ZREVRANGE` в структурах `ZSET`.
+* **ScyllaDB 2026 Cluster**: протокол **CQL v4 (Cassandra Query Language)** поверх асинхронного драйвера Seastar. Доступ строго по ключу `user_id`. Обеспечивает p99 $<5$ мс на чтение прогресса и персональных ошибок.
+* **OpenSearch 3.9 Cluster**: поисковые запросы по каталогу курсов по протоколу **HTTP/REST (JSON)**.
+* **Apache Kafka (KRaft)**: нативный бинарный **Kafka RPC Protocol**. Асинхронная отправка аналитики уроков (`analytics_events`) и 0,5% записей речи (`speech_raw`).
+
+#### 4. Асинхронный контур и аналитика (Near-line / Offline)
+* **Kafka-to-ClickHouse Consumer**: читает топик аналитики батчами по 20 000–50 000 сообщений и сбрасывает в ClickHouse 26.9 по нативному протоколу TCP каждые 5 секунд, предотвращая фрагментацию партиций.
+* **Speech Archiver**: асинхронно вычитывает отобранные 0,5% записей речи, сохраняет аудио в объектное хранилище SeaweedFS / S3 по протоколу **S3 REST API** (с жизненным циклом TTL = 90 дней) и записывает метаданные в ScyllaDB (`speech_samples`).
+* **HLR Model Offline Trainer**: ночной пересчет весов психометрической модели забывания слов в ClickHouse на GPU/CPU кластере с последующей доставкой свежих матриц весов в `Progress & Practice Service`.
+
+#### 5. Контур наблюдаемости (Observability)
+* **DaemonSet Agents (Vector + OpenTelemetry Collector)**: собирают метрики (`/metrics` endpoints по pull-модели) и логи со stdout контейнеров через чтение локального лог-файла на ноде с буферизацией на SSD. Это исключает падение сервисов при сетевых задержках систем логирования.
+* Доставка телеметрии осуществляется пакетно по открытым протоколам: метрики — в **VictoriaMetrics** по Remote Write; логи — в **Grafana Loki** по Push API; трейсы — в **Grafana Tempo** по OTLP gRPC. Дашбординг и алерты выводятся через **Grafana 11**.
+
+---
+
 ## Список источников
 
 1. <a id="source1"></a>[Duolingo Reports Fourth Quarter and Full Year 2025 Results — GlobeNewsWire](https://www.globenewswire.com/news-release/2026/02/26/3246047/0/en/duolingo-reports-fourth-quarter-and-full-year-2025-results.html)

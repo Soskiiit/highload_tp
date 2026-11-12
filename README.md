@@ -983,7 +983,7 @@ erDiagram
 
 ### 9.2 Graceful degradation: архитектурные приёмы
 
-Принцип: при поломке компонента пользователь получает **пусть менее точную, но приближённую к реальности информацию, а не пустой экран**. Каждый приём ниже — это новая (пунктирная) стрелка на схеме §10.1.
+Принцип: при поломке компонента пользователь получает **пусть менее точную, но приближённую к реальности информацию, а не пустой экран**. Каждый приём ниже соответствует стрелке на схеме §10.1 (пунктирные — деградационные пути).
 
 #### Приём 1. Дублирование счётчиков XP/streak в другом хранилище (Redis + Scylla)
 
@@ -997,10 +997,10 @@ erDiagram
 
 #### Приём 2. Fallback-кэш уроков в Practice Hub / сборке урока
 
-* **Новая стрелка:** `Lessons API -.-> Fallback-кэш уроков (fallback R)`.
+* **Стрелка на схеме:** `Lessons API → Fallback-кэш уроков (R/W)` — запись сборки и fallback-чтение в одной ветке.
 * **Норма:** персональная сборка — HLR-ранжер (mistakes + θ из Scylla Progress) + контент из Content.
 * **Проблема:** недоступность Scylla Progress / feature store, таймаут HLR (> 25 мс), отказ Content.
-* **Приём:** Lessons API кэширует последнюю успешную сборку на пользователя+курс (стрелка W при каждом успехе) и хранит статический набор популярных упражнений (обновляется из Content ежедневно). При отказе ранжера/фич — отдача из кэша: неперсонализированный, но валидный урок из 10–15 упражнений.
+* **Приём:** Lessons API кэширует последнюю успешную сборку на пользователя+курс (при каждом успехе) и хранит статический набор популярных упражнений (обновляется из Content ежедневно). При отказе ранжера/фич — отдача из кэша: неперсонализированный, но валидный урок из 10–15 упражнений.
 * **Эффект:** пользователь продолжает заниматься вместо пустого экрана; персонализация возвращается после восстановления.
 * **Дополнительно на клиенте:** SQLite-кэш уроков (§3.6) — занятие продолжается даже при обрыве сети.
 
@@ -1015,10 +1015,10 @@ erDiagram
 | Отказ | Детектирование | Что получает пользователь | Стрелка на схеме | Свежесть данных |
 |---|---|---|---|---|
 | Redis Gamification | Circuit breaker, health-check | Приближённые лидерборд / XP / streak из ledger | `GamifAPI -.-> ScyllaGamif` | Лаг консьюмера (секунды) |
-| Scylla Progress / HLR / θ | Таймаут 25 мс, circuit breaker | Кэшированный / статический урок | `LessonAPI -.-> LessonCache` | Последняя успешная сборка |
+| Scylla Progress / HLR / θ | Таймаут 25 мс, circuit breaker | Кэшированный / статический урок | `LessonAPI → LessonCache` | Последняя успешная сборка |
 | S3 Content / origin | Health-check CDN | Stale-аудио + клиентский кэш | `CDN -.-> S3Content` (stale) | TTL 24 ч |
 | Speech GPU | `/healthz`, circuit breaker | Упражнение без проверки произношения, без штрафа | — (продуктовое решение) | — |
-| Kafka | Буфер продюсера, outbox | Ничего не теряется: события копятся в outbox / на клиенте | `Outbox relay → Kafka` | Догон после восстановления |
+| Kafka | Буфер продюсера, outbox | Ничего не теряется: события копятся в outbox / на клиенте | `Outbox relay → lesson_submitted` | Догон после восстановления |
 
 Переключение режимов выполняется автоматически (пороги circuit breaker Envoy), наблюдаемость — через обособленный контур (§10.1): алерты Alertmanager, дашборды Grafana. Деградация не смешивается с бизнес-DWH и не зависит от его доступности.
 
@@ -1107,8 +1107,13 @@ flowchart TD
     end
 
     %% ===== Событийная шина (обособлена) =====
-    subgraph S_KAFKA["Событийная шина"]
-        Kafka["Apache Kafka (KRaft)<br/>фронт: frontend_events<br/>бэк: lesson_submitted, speech_raw,<br/>auth_events, account_events, content_events"]
+    subgraph S_KAFKA["Событийная шина — Apache Kafka (KRaft)"]
+        T_AUTH["auth_events"]
+        T_ACCOUNT["account_events"]
+        T_LESSON["lesson_submitted"]
+        T_CONTENT["content_events"]
+        T_SPEECH["speech_raw"]
+        T_FRONT["frontend_events"]
     end
 
     %% ===== Оффлайн-контур =====
@@ -1150,52 +1155,47 @@ flowchart TD
     %% ===== Auth =====
     AuthAPI -->|"R/W"| PostgresAuth
     AuthAPI -->|"R/W"| RedisSessions
-    AuthAPI -->|"auth_events (logout, pwd)"| Kafka
-    Kafka -->|"account_events"| AuthConsumer
-    AuthConsumer -->|"W (DEL sess)"| RedisSessions
+    AuthAPI -->|"logout, pwd"| T_AUTH
+    T_ACCOUNT --> AuthConsumer
 
     %% ===== Users =====
     UsersAPI -->|"R/W"| UsersCache
     UsersAPI -->|"R/W"| PostgresUsers
     UsersAPI -->|"R: XP / gems / streak"| GamifAPI
     UsersAPI -->|"R: прогресс курсов"| LessonAPI
-    UsersAPI -->|"account_events (delete, email)"| Kafka
-    Kafka -->|"auth_events"| UsersConsumer
-    UsersConsumer -->|"W (инвалидация)"| UsersCache
+    UsersAPI -->|"delete, email"| T_ACCOUNT
+    T_AUTH --> UsersConsumer
     UsersConsumer -->|"W (удаление профиля)"| PostgresUsers
 
     %% ===== Progress & Practice =====
     LessonAPI --> HLRRanker
-    LessonAPI -->|"R (прогресс)"| ScyllaProgress
-    LessonAPI -->|"W (progress + outbox, одна партиция)"| ScyllaProgress
+    LessonAPI -->|"R/W (progress + outbox)"| ScyllaProgress
     HLRRanker -->|"R (mistakes, θ)"| ScyllaProgress
     OutboxRelay -->|"R (outbox)"| ScyllaProgress
-    OutboxRelay -->|"lesson_submitted"| Kafka
+    OutboxRelay --> T_LESSON
     LessonAPI -->|"R: контент упражнений"| ContentAPI
     LessonAPI -->|"R: hearts / лимиты"| GamifAPI
-    LessonAPI -->|"W (кэш сборки)"| LessonCache
-    LessonAPI -.->|"fallback R"| LessonCache
+    LessonAPI -->|"R/W"| LessonCache
 
     %% ===== Gamification & Leagues =====
-    Kafka -->|"lesson_submitted"| GamifConsumer
-    GamifConsumer -->|"W (HINCRBY, ZADD)"| RedisGamif
+    T_LESSON --> GamifConsumer
     GamifConsumer -->|"W (ledger upsert)"| ScyllaGamif
-    GamifAPI -->|"R (ZREVRANGE)"| RedisGamif
+    GamifAPI -->|"R/W"| RedisGamif
     GamifAPI -.->|"fallback R (отказ Redis)"| ScyllaGamif
     GamifAPI -->|"R: профили Top-30"| UsersAPI
 
     %% ===== Content =====
     ContentAPI -->|"R"| PostgresContent
     PublishAPI -->|"W (контент + outbox)"| PostgresContent
-    PublishAPI -->|"content_events"| Kafka
-    Kafka -->|"content_events (синтез)"| MediaWorker
+    PublishAPI --> T_CONTENT
+    T_CONTENT --> MediaWorker
     MediaWorker -->|"W (аудио / ассеты)"| S3Content
     MediaWorker -->|"W (метаданные)"| PostgresContent
     MediaWorker -.->|"push / invalidate"| CDN
 
     %% ===== Search =====
     SearchAPI -->|"R"| OpenSearch
-    Kafka -->|"content_events"| Indexer
+    T_CONTENT --> Indexer
     Indexer -->|"W (индекс)"| OpenSearch
 
     %% ===== Speech =====
@@ -1204,13 +1204,13 @@ flowchart TD
     Spectro --> Conformer
     Conformer --> GoPAlign
     GoPAlign --> Sampler
-    Sampler -->|"speech_raw (0,5%)"| Kafka
+    Sampler -->|"0,5%"| T_SPEECH
 
     %% ===== Events =====
-    EventsAPI -->|"frontend_events"| Kafka
+    EventsAPI --> T_FRONT
 
     %% ===== Оффлайн: DWH =====
-    Kafka -->|"frontend_events + backend"| DWHConsumer
+    S_KAFKA -->|"все топики"| DWHConsumer
     DWHConsumer -->|"W (батчи)"| ClickHouse
     Reconcile -->|"R"| ClickHouse
 
@@ -1219,7 +1219,7 @@ flowchart TD
     HLRTrainer -->|"W (θ)"| ScyllaProgress
     MistakesBuilder -->|"R"| ClickHouse
     MistakesBuilder -->|"W (user_mistakes)"| ScyllaProgress
-    Kafka -->|"speech_raw"| SpeechArchiver
+    T_SPEECH --> SpeechArchiver
     SpeechArchiver -->|"W (аудио)"| S3Speech
     SpeechArchiver -->|"W (метаданные)"| ScyllaSpeech
     LeagueFinalizer -->|"R/W (финализация когорт)"| RedisGamif

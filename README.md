@@ -962,32 +962,6 @@ erDiagram
 
 При отказе любого шага событие остаётся в Kafka (retention 7 дней) / retry-топике; консьюмеры идемпотентны, поэтому цепочка **догоняется до конца** с любой задержкой. Poison-сообщения уходят в DLQ + алерт (Alertmanager). Рассогласования «навсегда» не возникает: источник истины по XP — ledger, Redis — материализованное представление.
 
-```mermaid
-sequenceDiagram
-    participant C as Клиент
-    participant P as Progress (Lessons API)
-    participant SP as Scylla Progress
-    participant R as Outbox relay
-    participant K as Kafka
-    participant G as Gamification-консьюмер
-    participant SG as Scylla xp_ledger
-    participant RG as Redis Gamification
-    participant D as DWH-консьюмер
-    participant CH as ClickHouse
-
-    C->>P: POST /submit (submission_id)
-    P->>SP: TX: progress + outbox (партиция user_id)
-    SP-->>P: commit
-    P-->>C: 200 OK (оптимистичный XP)
-    R->>SP: R (outbox)
-    R->>K: lesson_submitted (at-least-once)
-    K->>G: событие
-    G->>SG: W upsert ledger (дедуп event_id)
-    G->>RG: W HINCRBY / ZADD
-    K->>D: событие (батч)
-    D->>CH: W batch (дедуп event_id)
-```
-
 #### Места двойной записи и их обоснование
 
 Последовательная запись в два хранилища = риск рассогласования. Все такие места на схеме и их решения:

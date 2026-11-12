@@ -603,7 +603,7 @@ erDiagram
 
     %% Аналитика и DWH
     users ||--o{ dwh_events : "streams events"
-    dwh_events ..> user_mistakes : "asynchronously builds"
+    dwh_events ||..o{ user_mistakes : "asynchronously builds"
 
     %% Соревнования
     league_cohorts }o--o{ users : "groups 30 users"
@@ -929,160 +929,364 @@ erDiagram
 
 ---
 
+## 9. Обеспечение надёжности
+
+Надёжность рассматривается **на архитектурной схеме (§10)**: сначала — асинхронные паттерны и способ синхронизации распределённых транзакций, затем — архитектурные приёмы graceful degradation, каждый из которых добавляет на схему новую стрелку. Инфраструктурное резервирование (DNS-failover, матрица отказов ДЦ) разобрано в §3.6, репликация хранилищ и кворумы — в §6.4; настоящий раздел описывает прикладной уровень.
+
+### 9.1 Асинхронные паттерны и синхронизация распределённых транзакций
+
+**Базовый принцип:** синхронный путь запроса — это чтения и одна локальная write-транзакция; все тяжёлые и межсервисные записи выполняются асинхронно через Kafka («синхронно мы практически ничего не пишем»). Распределённых транзакций (2PC) в системе нет: ScyllaDB, Redis и Kafka их не поддерживают, а 2PC добавил бы блокировки и задержку на пике 4 270 RPS. Согласованность достигается связкой **Transactional Outbox + Saga (choreography) + идемпотентные консьюмеры**.
+
+#### Используемые паттерны
+
+| Паттерн | Где на схеме (§10.1) | Механизм |
+|---|---|---|
+| **Transactional Outbox** | Progress: `POST /submit`; Content: Publish API | Бизнес-сущность и outbox-запись пишутся одной локальной транзакцией (Scylla — одна партиция `user_id`; PostgreSQL — один tx). Relay вычитывает outbox и публикует в Kafka (at-least-once). Окна «записал в БД, не записал в Kafka» не существует. |
+| **Saga (choreography)** | Сдача урока: Progress → Kafka → Gamification / DWH / Mistakes builder | Каждый шаг — локальная транзакция + событие для следующего. Координатора нет; при сбоях цепочка догоняется ретраями до конца. |
+| **At-least-once + идемпотентные консьюмеры** | Gamification-консьюмер, DWH-консьюмер, Speech Archiver, Indexer | Дедупликация по `event_id` / `sample_id` / версии документа; повторная обработка безопасна. |
+| **Асинхронная инвалидация** | Auth ↔ Users (`auth_events` / `account_events`) | Logout / смена пароля / удаление аккаунта → событие → инвалидация сессий и кэша профиля; TTL — страховочный механизм. |
+| **Асинхронное переобучение ML** | HLR-тренер (ежедневно), Mistakes builder (near-line) | Онлайн-контур не зависит от доступности оффлайн-контура: веса θ и срез ошибок обновляются с задержкой, сервис продолжает работать на текущей версии. |
+| **Durable event log** | `xp_ledger` (Scylla Gamification), `dwh_events` (ClickHouse) | Счётчики пересчитываются из лога; Redis после сбоя (RPO ≤ 1 с) восстанавливается replay'ем ledger. |
+
+#### Синхронизация распределённой транзакции «сдача урока»
+
+Бизнес-транзакция «урок сдан» затрагивает три хранилища разных сервисов: прогресс (Scylla Progress), геймификация (Redis + Scylla Gamification), аналитика (ClickHouse). Последовательная запись в них из одного запроса дала бы «недоезд» при сбое на любом шаге. Вместо этого — outbox + saga:
+
+1. Клиент отправляет `POST /lessons/:id/submit` с **идемпотентным ключом** `submission_id` (генерируется на клиенте, защищает от повторной сдачи при ретраях сети).
+2. Progress выполняет **одну атомарную запись** в Scylla в пределах партиции `user_id`: обновление прогресса + outbox-запись (`event_id = submission_id`). Либо оба, либо ничего.
+3. Клиент немедленно получает `200 OK` (XP показывается оптимистично); тяжёлых синхронных записей в другие сервисы нет.
+4. Outbox relay публикует `lesson_submitted` в Kafka (at-least-once; запись удаляется из outbox только после ack брокера).
+5. **Gamification-консьюмер**: дедуп по `event_id` → durable upsert в `xp_ledger` (Scylla) → `HINCRBY`/`ZADD` в Redis. Порядок «сначала durable, потом hot» гарантирует, что счётчик не потеряется.
+6. **DWH-консьюмер**: батч 20–50k строк → ClickHouse (дедуп по `event_id`, `ReplacingMergeTree`).
+7. **Mistakes builder** (near-line): ClickHouse → обновление `user_mistakes` в Scylla Progress для следующего захода в Practice Hub.
+
+При отказе любого шага событие остаётся в Kafka (retention 7 дней) / retry-топике; консьюмеры идемпотентны, поэтому цепочка **догоняется до конца** с любой задержкой. Poison-сообщения уходят в DLQ + алерт (Alertmanager). Рассогласования «навсегда» не возникает: источник истины по XP — ledger, Redis — материализованное представление.
+
+```mermaid
+sequenceDiagram
+    participant C as Клиент
+    participant P as Progress (Lessons API)
+    participant SP as Scylla Progress
+    participant R as Outbox relay
+    participant K as Kafka
+    participant G as Gamification-консьюмер
+    participant SG as Scylla xp_ledger
+    participant RG as Redis Gamification
+    participant D as DWH-консьюмер
+    participant CH as ClickHouse
+
+    C->>P: POST /submit (submission_id)
+    P->>SP: TX: progress + outbox (партиция user_id)
+    SP-->>P: commit
+    P-->>C: 200 OK (оптимистичный XP)
+    R->>SP: R (outbox)
+    R->>K: lesson_submitted (at-least-once)
+    K->>G: событие
+    G->>SG: W upsert ledger (дедуп event_id)
+    G->>RG: W HINCRBY / ZADD
+    K->>D: событие (батч)
+    D->>CH: W batch (дедуп event_id)
+```
+
+#### Места двойной записи и их обоснование
+
+Последовательная запись в два хранилища = риск рассогласования. Все такие места на схеме и их решения:
+
+| Место | Риск | Решение (согласованность пайплайна) |
+|---|---|---|
+| **Gamification-консьюмер: Redis + Scylla** | Сбой между записями → расхождение счётчиков | Сначала Scylla (`xp_ledger`, идемпотентный upsert по `event_id`), затем Redis. При сбое Redis — ретрай; после восстановления Redis прогревается из ledger. Источник истины — ledger, расхождение временно. |
+| **Speech Archiver: S3 + Scylla** | Объект без метаданных / метаданные без объекта | Сначала S3 PUT (ключ = `sample_id`, идемпотентная перезапись), затем метаданные в Scylla. Ретраи через Kafka; «сироты» в S3 убираются lifecycle-правилом / reconciliation-джобой. Принцип: **либо cleanup, либо догон до конца**. |
+| **Media-воркер: S3 + Content DB** | Публикация недоделанного контента | Сначала S3 (content-addressable hash → идемпотентно), затем метаданные одной tx; push на CDN — только после commit. При сбое — ретрай, сироты очищаются сверкой хэшей. |
+| **Регистрация: Auth + Users** | Аккаунт без профиля | Auth: локальная tx + outbox → `account_events` → Users создаёт профиль (идемпотентно по `user_id`). Login не зависит от готовности профиля; цепочка догоняется. |
+
+#### Синхронные паттерны
+
+* **Синхронные вызовы с дедлайнами** (внутренние вызовы ≤ 50 мс) и **circuit breaker + outlier detection** на Envoy-sidecar (§4.2): сбойный под исключается из маршрутизации на 30 с.
+* **Ретраи с exponential backoff + jitter** — только для идемпотентных чтений; записи защищены идемпотентными ключами (`submission_id`).
+* **Bulkhead**: Speech вынесен в изолированный GPU-контур (`speech.duolingo.com`, §3.1) — отказ или перегрузка распознавания не исчерпывает ресурсы Core API.
+* **Cache-aside + read-replicas**: PostgreSQL (чтение со standby), Scylla (`LOCAL_QUORUM`, R=W=2), Redis (master-replica per slot).
+* **Rate limiting и authN** на API Gateway; при таймауте зависимости — переход на graceful degradation (§9.2), а не ошибка пользователю.
+
+### 9.2 Graceful degradation: архитектурные приёмы
+
+Принцип: при поломке компонента пользователь получает **пусть менее точную, но приближённую к реальности информацию, а не пустой экран**. Каждый приём ниже — это новая (пунктирная) стрелка на схеме §10.1.
+
+#### Приём 1. Дублирование счётчиков XP/streak в другом хранилище (Redis + Scylla)
+
+* **Новая стрелка:** `Leaderboard API -.-> ScyllaDB Gamification (fallback R)`.
+* **Норма:** горячие счётчики и лидерборды живут в Redis Gamification (`HINCRBY`, `ZSET`) — субмиллисекундный доступ.
+* **Проблема:** репликация Redis асинхронна (RPO ≤ 1 с, §6.4) — при отказе мастера теряется до секунды инкрементов; при недоступности кластера лидерборд и профиль «слепнут».
+* **Приём:** Gamification-консьюмер параллельно пишет каждый инкремент в durable `xp_ledger` (Scylla, RF=3, `LOCAL_QUORUM`, RPO=0) — счётчик продублирован в другом хранилище.
+* **При отказе Redis:** circuit breaker размыкается, Leaderboard API читает Top-30 и XP/streak из ledger (пунктирная стрелка). Данные отстают на лаг консьюмера (секунды) — это **приближённые, но реальные** значения.
+* **Эффект:** пользователь видит лидерборд и свой прогресс вместо ошибки; после восстановления Redis прогревается из ledger.
+* **Цена:** +1 запись на событие (~4 270 RPS peak — ничтожно для Scylla), ~100 Б на пользователя.
+
+#### Приём 2. Fallback-кэш уроков в Practice Hub / сборке урока
+
+* **Новая стрелка:** `Lessons API -.-> Fallback-кэш уроков (fallback R)`.
+* **Норма:** персональная сборка — HLR-ранжер (mistakes + θ из Scylla Progress) + контент из Content.
+* **Проблема:** недоступность Scylla Progress / feature store, таймаут HLR (> 25 мс), отказ Content.
+* **Приём:** Lessons API кэширует последнюю успешную сборку на пользователя+курс (стрелка W при каждом успехе) и хранит статический набор популярных упражнений (обновляется из Content ежедневно). При отказе ранжера/фич — отдача из кэша: неперсонализированный, но валидный урок из 10–15 упражнений.
+* **Эффект:** пользователь продолжает заниматься вместо пустого экрана; персонализация возвращается после восстановления.
+* **Дополнительно на клиенте:** SQLite-кэш уроков (§3.6) — занятие продолжается даже при обрыве сети.
+
+#### Приём 3. TTS-аудио: stale-CDN + клиентский кэш
+
+* **Стрелка на схеме:** существующая `CDN -.-> S3 Content (origin miss)`; при недоступности origin CDN отдаёт **stale-while-revalidate**.
+* **Приём:** TTS-файлы immutable по content-hash (TTL 24 ч на Edge), клиент дополнительно кэширует прослушанное в SQLite. При отказе S3/origin аудио продолжает воспроизводиться из stale-кэша CDN и локального кэша.
+* **Эффект:** эталонная речь доступна; новые фразы синтезируются после восстановления (Media-воркер догоняет очередь `content_events`).
+
+#### Сводная таблица деградаций
+
+| Отказ | Детектирование | Что получает пользователь | Стрелка на схеме | Свежесть данных |
+|---|---|---|---|---|
+| Redis Gamification | Circuit breaker, health-check | Приближённые лидерборд / XP / streak из ledger | `GamifAPI -.-> ScyllaGamif` | Лаг консьюмера (секунды) |
+| Scylla Progress / HLR / θ | Таймаут 25 мс, circuit breaker | Кэшированный / статический урок | `LessonAPI -.-> LessonCache` | Последняя успешная сборка |
+| S3 Content / origin | Health-check CDN | Stale-аудио + клиентский кэш | `CDN -.-> S3Content` (stale) | TTL 24 ч |
+| Speech GPU | `/healthz`, circuit breaker | Упражнение без проверки произношения, без штрафа | — (продуктовое решение) | — |
+| Kafka | Буфер продюсера, outbox | Ничего не теряется: события копятся в outbox / на клиенте | `Outbox relay → Kafka` | Догон после восстановления |
+
+Переключение режимов выполняется автоматически (пороги circuit breaker Envoy), наблюдаемость — через обособленный контур (§10.1): алерты Alertmanager, дашборды Grafana. Деградация не смешивается с бизнес-DWH и не зависит от его доступности.
+
+---
+
 ## 10. Архитектурная схема проекта
 
 ### 10.1 Архитектурная диаграмма системы
 
 ```mermaid
 flowchart TD
-    %% 1. Клиенты, DNS и CDN
-    subgraph S_EDGE["1. Клиенты, DNS и CDN"]
-        Mobile["Мобильное приложение (iOS / Android)"]
-        Web["Веб-приложение (React SPA)"]
-        R53["Amazon Route 53 (DNS)"]
-        CDN["Edge PoP CDN (CloudFront)"]
+    %% ===== Клиенты =====
+    subgraph S_CLIENT["Клиенты"]
+        Mobile["Мобильный клиент (KMP)<br/>+ локальный SQLite-кэш"]
+        Web["Веб-клиент (React SPA)"]
     end
 
-    %% 2. Входной периметр
-    subgraph S_INGRESS["2. Входной периметр и Gateway"]
-        L4["L4 Balancer: IPVS (DR mode)"]
-        L7["L7 Ingress: Nginx (TLS / WAF)"]
-        APIGW["API Gateway (BFF Go)"]
+    %% ===== Периметр (свёрнут до минимума) =====
+    subgraph S_EDGE["Периметр и маршрутизация"]
+        CDN["Edge CDN (CloudFront)<br/>media / static"]
+        Ingress["L4 IPVS + L7 Nginx<br/>(TLS, WAF)"]
+        APIGW["API Gateway (BFF, Go)<br/>маршрутизация + authN,<br/>бизнес-композиция — в сервисах"]
     end
 
-    %% 3. Вычислительный контур (K8s)
-    subgraph S_APP["3. Вычислительный контур (Kubernetes EKS)"]
-        subgraph S_ML["GPU ML Cluster"]
-            SpeechSvc["Speech Verification (TensorRT)"]
+    %% ===== Онлайн-контур =====
+    subgraph S_ONLINE["ОНЛАЙН-КОНТУР (Kubernetes EKS)"]
+
+        subgraph S_AUTH["Auth Service — аккаунты и сессии"]
+            AuthAPI["Auth API<br/>регистрация / login / токены"]
+            AuthConsumer["Консьюмер account_events<br/>инвалидация сессий"]
+            PostgresAuth[("PostgreSQL Auth DB<br/>аккаунты, password_hash")]
+            RedisSessions[("Redis Sessions<br/>sess:token, TTL 30d")]
         end
-        subgraph S_CORE["Stateless Core Services"]
-            AuthSvc["Auth & Users"]
-            ProgressSvc["Progress & Practice (HLR)"]
-            GamifSvc["Gamification & Leagues"]
-            ContentSvc["Course Content Catalog"]
+
+        subgraph S_USERS["Users Service — профили"]
+            UsersAPI["Users API + композиция<br/>GET /user/progress (главная)"]
+            UsersCache["Кэш профиля (local)"]
+            UsersConsumer["Консьюмер auth_events<br/>инвалидация кэша / удаление"]
+            PostgresUsers[("PostgreSQL Users DB<br/>профиль, настройки, локаль")]
         end
-        subgraph S_ASYNC["Фоновые воркеры"]
-            SpeechArchiver["Speech S3 Archiver"]
-            DWHConsumer["Kafka-to-ClickHouse Consumer"]
-            LeagueWorker["League Leaderboard Finalizer"]
-            HLRTrainer["HLR Model Trainer"]
+
+        subgraph S_PROGRESS["Progress & Practice Service — уроки, HLR"]
+            LessonAPI["Lessons API + композиция<br/>GET /lessons/:id, /review/mistakes<br/>POST /submit (tx + outbox)"]
+            HLRRanker["HLR-ранжер / feature store (CPU)<br/>фичи из mistakes, веса θ,<br/>min-heap Top-K"]
+            OutboxRelay["Outbox relay"]
+            LessonCache["Fallback-кэш уроков<br/>последняя сборка + статический набор"]
+            ScyllaProgress[("ScyllaDB Progress<br/>progress, mistakes, θ, outbox<br/>partition key: user_id")]
+        end
+
+        subgraph S_GAMIF["Gamification & Leagues Service"]
+            GamifAPI["Leaderboard API + композиция<br/>GET /leaderboard, /user/gamification"]
+            GamifConsumer["Консьюмер lesson_submitted<br/>XP / streak / лиги"]
+            RedisGamif[("Redis Gamification<br/>gamif HASH (HINCRBY)<br/>league ZSET (ZADD)")]
+            ScyllaGamif[("ScyllaDB Gamification<br/>xp_ledger (durable, RPO=0)")]
+        end
+
+        subgraph S_CONTENT["Course Content Service"]
+            ContentAPI["Content API<br/>каталог / уроки / упражнения"]
+            PublishAPI["Publish API + outbox relay<br/>публикация контента"]
+            MediaWorker["Media-воркер<br/>TTS (Amazon Polly) + статика"]
+            PostgresContent[("PostgreSQL Content DB<br/>courses…exercises, tts_audio,<br/>static_assets, outbox")]
+            S3Content[("S3 Content<br/>TTS Opus + статика")]
+        end
+
+        subgraph S_SEARCH["Search Service"]
+            SearchAPI["Search API<br/>GET /courses (поиск)"]
+            Indexer["Воркер-индексатор"]
+            OpenSearch[("OpenSearch<br/>courses_search_index")]
+        end
+
+        subgraph S_SPEECH["Speech Verification Service (GPU EC2)"]
+            direction LR
+            Ingest["Приём аудио"]
+            Decoder["Декодер libopus<br/>→ PCM"]
+            Spectro["Спектрограмма<br/>log-mel 80"]
+            Conformer["Conformer-CTC<br/>TensorRT FP16"]
+            GoPAlign["Forced alignment<br/>+ GoP"]
+            Sampler["Сэмплер 0,5%<br/>99,5% стирается в RAM"]
+            ScyllaSpeech[("ScyllaDB Speech<br/>speech_samples, TTL 90d")]
+            S3Speech[("S3 Speech<br/>записи речи, TTL 90d")]
+        end
+
+        subgraph S_EVENTS["Events Service — фронтовые события"]
+            EventsAPI["Events API<br/>POST /events (батчи)<br/>валидация / обогащение"]
         end
     end
 
-    %% 4. Очереди и брокеры
-    subgraph S_QUEUE["4. Событийная шина"]
-        Kafka["Apache Kafka Cluster"]
+    %% ===== Событийная шина (обособлена) =====
+    subgraph S_KAFKA["Событийная шина"]
+        Kafka["Apache Kafka (KRaft)<br/>фронт: frontend_events<br/>бэк: lesson_submitted, speech_raw,<br/>auth_events, account_events, content_events"]
     end
 
-    %% 5. Хранилища данных
-    subgraph S_DATA["5. Хранилища данных (Базы, Кэши, S3)"]
-        S3Storage[("SeaweedFS / S3 Storage")]
-        PostgresUsers[("PostgreSQL: Users DB")]
-        RedisCluster[("Redis Cluster")]
-        Scylla[("ScyllaDB Cluster")]
-        PostgresContent[("PostgreSQL: Content DB")]
-        OpenSearch[("OpenSearch Cluster")]
-        ClickHouse[("ClickHouse Cluster")]
+    %% ===== Оффлайн-контур =====
+    subgraph S_OFFLINE["ОФФЛАЙН / NEAR-LINE КОНТУР"]
+
+        subgraph S_DWH["DWH / Analytics Service"]
+            DWHConsumer["DWH-консьюмер<br/>батчи 20–50k строк"]
+            Reconcile["Сверка front ↔ back<br/>+ ML-витрины"]
+            ClickHouse[("ClickHouse<br/>dwh_events")]
+        end
+
+        HLRTrainer["HLR-тренер (домен Progress)<br/>ежедневно, Spark / PyTorch"]
+        MistakesBuilder["Mistakes builder (домен Progress)<br/>near-line из DWH"]
+        SpeechArchiver["Speech Archiver (домен Speech)"]
+        LeagueFinalizer["League Finalizer (домен Gamification)<br/>недельный"]
     end
 
-    %% 6. Наблюдаемость
-    subgraph S_OBS["6. Контур наблюдаемости"]
-        OtelAgent["OTel Collector & Vector (DaemonSet)"]
-        VicMetrics["VictoriaMetrics (Метрики)"]
-        Loki["Grafana Loki (Логи)"]
-        Tempo["Grafana Tempo (Трейсы)"]
-        GrafanaUI["Grafana (Дашборды и Алерты)"]
+    %% ===== Наблюдаемость (обособлена) =====
+    subgraph S_OBS["Контур наблюдаемости"]
+        OtelAgent["OTel Collector + Vector<br/>(DaemonSet, буфер на ноде)"]
+        VicMetrics[("VictoriaMetrics<br/>метрики")]
+        Loki[("Grafana Loki<br/>логи")]
+        Tempo[("Grafana Tempo<br/>трейсы")]
+        Grafana["Grafana + Alertmanager<br/>дашборды / алерты"]
     end
 
-    %% Клиентский трафик
-    Mobile --> R53
-    Web --> R53
+    %% ===== Клиентский трафик =====
+    Mobile --> Ingress
+    Web --> Ingress
     Mobile --> CDN
     Web --> CDN
-    Mobile --> L4
-    Web --> L4
-    CDN -.-> L4
+    CDN -.->|"origin miss (R)"| S3Content
+    Ingress --> APIGW
+    Ingress -->|"speech/*"| S_SPEECH
 
-    %% Входной трафик в ЦОД
-    L4 --> L7
-    L7 --> APIGW
-    L7 --> SpeechSvc
+    %% ===== Gateway: одна стрелка маршрутизации; трафик через него подразумевается, зависимости сервисов — напрямую =====
+    APIGW -->|"маршрутизация"| S_ONLINE
 
-    %% Синхронный RPC от Gateway
-    APIGW --> AuthSvc
-    APIGW --> ProgressSvc
-    APIGW --> GamifSvc
-    APIGW --> ContentSvc
+    %% ===== Auth =====
+    AuthAPI -->|"R/W"| PostgresAuth
+    AuthAPI -->|"R/W"| RedisSessions
+    AuthAPI -->|"auth_events (logout, pwd)"| Kafka
+    Kafka -->|"account_events"| AuthConsumer
+    AuthConsumer -->|"W (DEL sess)"| RedisSessions
 
-    %% Обращения Core в базы
-    AuthSvc --> PostgresUsers
-    AuthSvc --> RedisCluster
-    ProgressSvc --> Scylla
-    GamifSvc --> RedisCluster
-    ContentSvc --> PostgresContent
-    ContentSvc --> OpenSearch
+    %% ===== Users =====
+    UsersAPI -->|"R/W"| UsersCache
+    UsersAPI -->|"R/W"| PostgresUsers
+    UsersAPI -->|"R: XP / gems / streak"| GamifAPI
+    UsersAPI -->|"R: прогресс курсов"| LessonAPI
+    UsersAPI -->|"account_events (delete, email)"| Kafka
+    Kafka -->|"auth_events"| UsersConsumer
+    UsersConsumer -->|"W (инвалидация)"| UsersCache
+    UsersConsumer -->|"W (удаление профиля)"| PostgresUsers
 
-    %% Асинхронные события в брокер
-    ProgressSvc --> Kafka
-    SpeechSvc --> Kafka
+    %% ===== Progress & Practice =====
+    LessonAPI --> HLRRanker
+    LessonAPI -->|"R (прогресс)"| ScyllaProgress
+    LessonAPI -->|"W (progress + outbox, одна партиция)"| ScyllaProgress
+    HLRRanker -->|"R (mistakes, θ)"| ScyllaProgress
+    OutboxRelay -->|"R (outbox)"| ScyllaProgress
+    OutboxRelay -->|"lesson_submitted"| Kafka
+    LessonAPI -->|"R: контент упражнений"| ContentAPI
+    LessonAPI -->|"R: hearts / лимиты"| GamifAPI
+    LessonAPI -->|"W (кэш сборки)"| LessonCache
+    LessonAPI -.->|"fallback R"| LessonCache
 
-    %% Вычитка воркерами из брокера
-    Kafka --> DWHConsumer
-    Kafka --> SpeechArchiver
+    %% ===== Gamification & Leagues =====
+    Kafka -->|"lesson_submitted"| GamifConsumer
+    GamifConsumer -->|"W (HINCRBY, ZADD)"| RedisGamif
+    GamifConsumer -->|"W (ledger upsert)"| ScyllaGamif
+    GamifAPI -->|"R (ZREVRANGE)"| RedisGamif
+    GamifAPI -.->|"fallback R (отказ Redis)"| ScyllaGamif
+    GamifAPI -->|"R: профили Top-30"| UsersAPI
 
-    %% Запись воркеров в базы
-    SpeechArchiver --> S3Storage
-    SpeechArchiver --> Scylla
-    DWHConsumer --> ClickHouse
-    LeagueWorker --> RedisCluster
-    HLRTrainer --> ClickHouse
-    HLRTrainer -.-> ProgressSvc
+    %% ===== Content =====
+    ContentAPI -->|"R"| PostgresContent
+    PublishAPI -->|"W (контент + outbox)"| PostgresContent
+    PublishAPI -->|"content_events"| Kafka
+    Kafka -->|"content_events (синтез)"| MediaWorker
+    MediaWorker -->|"W (аудио / ассеты)"| S3Content
+    MediaWorker -->|"W (метаданные)"| PostgresContent
+    MediaWorker -.->|"push / invalidate"| CDN
 
-    %% Сбор телеметрии
-    S_APP -.-> OtelAgent
+    %% ===== Search =====
+    SearchAPI -->|"R"| OpenSearch
+    Kafka -->|"content_events"| Indexer
+    Indexer -->|"W (индекс)"| OpenSearch
+
+    %% ===== Speech =====
+    Ingest --> Decoder
+    Decoder --> Spectro
+    Spectro --> Conformer
+    Conformer --> GoPAlign
+    GoPAlign --> Sampler
+    Sampler -->|"speech_raw (0,5%)"| Kafka
+
+    %% ===== Events =====
+    EventsAPI -->|"frontend_events"| Kafka
+
+    %% ===== Оффлайн: DWH =====
+    Kafka -->|"frontend_events + backend"| DWHConsumer
+    DWHConsumer -->|"W (батчи)"| ClickHouse
+    Reconcile -->|"R"| ClickHouse
+
+    %% ===== Оффлайн: тренеры и воркеры =====
+    HLRTrainer -->|"R"| ClickHouse
+    HLRTrainer -->|"W (θ)"| ScyllaProgress
+    MistakesBuilder -->|"R"| ClickHouse
+    MistakesBuilder -->|"W (user_mistakes)"| ScyllaProgress
+    Kafka -->|"speech_raw"| SpeechArchiver
+    SpeechArchiver -->|"W (аудио)"| S3Speech
+    SpeechArchiver -->|"W (метаданные)"| ScyllaSpeech
+    LeagueFinalizer -->|"R/W (финализация когорт)"| RedisGamif
+
+    %% ===== Телеметрия =====
+    S_ONLINE -.-> OtelAgent
+    S_OFFLINE -.-> OtelAgent
     OtelAgent --> VicMetrics
     OtelAgent --> Loki
     OtelAgent --> Tempo
-    VicMetrics --> GrafanaUI
-    Loki --> GrafanaUI
-    Tempo --> GrafanaUI
+    VicMetrics --> Grafana
+    Loki --> Grafana
+    Tempo --> Grafana
 ```
 
 ---
 
-### 10.2 Описание компонентов и сетевых протоколов взаимодействия
+### 10.2 Пояснения к схеме
 
-#### 1. Клиенты, Edge и сетевой периметр (Ingress Layer)
-* **Mobile / Web Clients $\to$ Amazon Route 53**: разрешение доменных имен (`api.duolingo.com`, `speech.duolingo.com`, `cdn.duolingo.com`) через Latency-based и Geolocation DNS-политики с поддержкой EDNS Client Subnet (ECS, RFC 7871).
-* **Clients $\to$ Edge PoP CDN (AWS CloudFront)**: протоколы **HTTPS (HTTP/2, HTTP/3 QUIC)**. Кэширование статических изображений и pre-rendered аудиофрагментов TTS (Opus mono, ~20 КБ). Снижает обращение к Origin-серверам на 90%.
-* **Clients $\to$ L4 Балансировщики (IPVS + keepalived)**: протоколы **TCP/TLS** на порты 443 и 8443. L4 работает в режиме Direct Routing (DR / DSR): пакеты передаются на L7 с сохранением клиентского IP, а обратный ответ L7-ноды направляют клиентам напрямую в интернет через шлюз, минуя L4.
-* **L4 $\to$ L7 Ingress (Nginx 1.27)**: Nginx производит терминацию TLS, валидацию базовых WAF-правил (Coraza/AWS WAF) и маршрутизирует трафик в кластер Kubernetes по долгоживущим HTTP/2 keep-alive пулам соединений.
+**Сервисы и хранилища.** Онлайн-контур — 8 сервисов; у каждого своя зона ответственности и свои хранилища (одна БД сервиса = один кубик, стрелки помечены R/W). Auth отделён от Users: аккаунты/пароли/сессии против профиля/настроек; между ними асинхронная инвалидация (`auth_events` / `account_events`).
 
-#### 2. Микросервисный контур (Service Mesh & Core Services)
-* **L7 Ingress $\to$ API Gateway & Speech Service**: HTTP/2 трафик разделяется по доменным префиксам:
-  * `/speech/*` (домен `speech.duolingo.com`) уходит напрямую на высокопроизводительный **Speech Verification Service** на GPU-нодах (EC2 G5), изолируя тяжелый поток (1 Гбит/с) от бизнес-логики.
-  * `/api/*` уходит на **API Gateway (BFF)**.
-* **API Gateway $\to$ Stateless Core Services**: синхронное межсервисное взаимодействие по протоколу **gRPC (HTTP/2 + Protobuf)** через Envoy Service Mesh:
-  * **Auth & Users Service**: авторизация, проверка токенов сессий, управление профилем.
-  * **Progress & Practice Service**: расчет адаптивных уроков; выполняет онлайн-инференс алгоритма HLR (Half-Life Regression) на CPU за $<2$ мс.
-  * **Gamification & League Service**: начисление XP, алмазов, расчет стриков и еженедельных когорт лиг.
-  * **Course Content Catalog Service**: каталог курсов, грамматических юнитов и упражнений.
+**API-композиции — в сервисах-владельцах, не в Gateway.** Users собирает главную (Gamification + Progress), Progress — урок и Practice Hub (Content + Gamification + HLR), Gamification — лидерборд (Users). API Gateway делает только маршрутизацию и authN (проверка токена через Auth → Redis Sessions); трафик через него подразумевается, поэтому на схеме одна стрелка, а зависимости — напрямую сервис → сервис. Speech идёт напрямую от Ingress, минуя Gateway (изоляция тяжёлого GPU-потока от Core API).
 
-#### 3. Взаимодействие с базами данных и брокерами
-* **PostgreSQL 18 (Users DB & Content DB)**: бинарный PostgreSQL wire protocol через пул соединений (pgxpool) с разделением путей Read/Write (чтение с локальных Standby-реплик).
-* **Redis 8.10 Cluster**: протокол **RESP (REdis Serialization Protocol)**. Сессии проверяются за $<1$ мс ($O(1)$). Начисление XP выполняется атомарными командами `HINCRBY`. Лидерборды комнат по 30 человек рассчитываются через `ZADD` и `ZREVRANGE` в структурах `ZSET`.
-* **ScyllaDB 2026 Cluster**: протокол **CQL v4 (Cassandra Query Language)** поверх асинхронного драйвера Seastar. Доступ строго по ключу `user_id`. Обеспечивает p99 $<5$ мс на чтение прогресса и персональных ошибок.
-* **OpenSearch 3.9 Cluster**: поисковые запросы по каталогу курсов по протоколу **HTTP/REST (JSON)**.
-* **Apache Kafka (KRaft)**: нативный бинарный **Kafka RPC Protocol**. Асинхронная отправка аналитики уроков (`analytics_events`) и 0,5% записей речи (`speech_raw`).
+**Фронтовые события.** Events-сервис принимает события клиента — что он реально увидел/прослушал (бэкенд этого не знает) — и пишет в `frontend_events`; клиент не ходит в Kafka напрямую. Бэкендовые события — отдельные топики; сверка front ↔ back выполняется в DWH.
 
-#### 4. Асинхронный контур и аналитика (Near-line / Offline)
-* **Kafka-to-ClickHouse Consumer**: читает топик аналитики батчами по 20 000–50 000 сообщений и сбрасывает в ClickHouse 26.9 по нативному протоколу TCP каждые 5 секунд, предотвращая фрагментацию партиций.
-* **Speech Archiver**: асинхронно вычитывает отобранные 0,5% записей речи, сохраняет аудио в объектное хранилище SeaweedFS / S3 по протоколу **S3 REST API** (с жизненным циклом TTL = 90 дней) и записывает метаданные в ScyllaDB (`speech_samples`).
-* **HLR Model Offline Trainer**: ночной пересчет весов психометрической модели забывания слов в ClickHouse на GPU/CPU кластере с последующей доставкой свежих матриц весов в `Progress & Practice Service`.
+**Асинхронные записи.** Тяжёлые записи — только через outbox → Kafka (сдача урока в Progress, публикация контента в Content); доставка at-least-once, консьюмеры идемпотентны. Синхронизация распределённых транзакций и места двойной записи — §9.1.
 
-#### 5. Контур наблюдаемости (Observability)
-* **DaemonSet Agents (Vector + OpenTelemetry Collector)**: собирают метрики (`/metrics` endpoints по pull-модели) и логи со stdout контейнеров через чтение локального лог-файла на ноде с буферизацией на SSD. Это исключает падение сервисов при сетевых задержках систем логирования.
-* Доставка телеметрии осуществляется пакетно по открытым протоколам: метрики — в **VictoriaMetrics** по Remote Write; логи — в **Grafana Loki** по Push API; трейсы — в **Grafana Tempo** по OTLP gRPC. Дашбординг и алерты выводятся через **Grafana 11**.
+**Оффлайн-контур.** ClickHouse — RW: пишет DWH-консьюмер, читают тренеры и витрины. Отказ оффлайн-контура не останавливает обучение: θ и срез ошибок догоняются с задержкой. Наблюдаемость обособлена от бизнес-DWH и не падает вместе с ним.
+
+**Согласование с §§5–6.** `users` разделён по владельцам: `auth_accounts` (Auth DB) и `user_profiles` (Users DB). Redis — два кластера (Sessions, Gamification); Scylla — три по владельцам (Progress, Speech, Gamification). Новые сущности: `outbox` (Progress, Content), `xp_ledger` (Gamification). Сайзинг §6.5 уточняется: кластеров больше, нагрузка на каждый ниже; репликация и кворумы (§6.4) без изменений.
+
+### 10.3 Трассировка сценариев
+
+Вход всех сценариев: клиент → Ingress → APIGW (кроме Speech — напрямую от Ingress).
+
+1. **Открой урок**: Progress (композиция: Content + Gamification + HLR/Scylla) → ответ; аудио — с CDN (origin — S3 Content).
+2. **Сдай урок**: Progress → Scylla (progress + outbox) → Kafka → Gamification / DWH; фронт параллельно через Events. Детально — §9.1.
+3. **Проверь произношение**: Speech GPU-конвейер → оценка; 0,5% сэмплов → Kafka → Archiver → S3 + Scylla.
+4. **Лидерборд**: Gamification → Redis (Top-30) + Users (профили); при отказе Redis — Scylla ledger (§9.2).
+5. **Работа над ошибками**: Progress → HLR (mistakes, θ из Scylla) → Content; при отказе — fallback-кэш (§9.2).
+6. **Найди курс**: Search → OpenSearch; индекс обновляется: Content outbox → Kafka → Indexer.
 
 ---
 

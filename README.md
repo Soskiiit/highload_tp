@@ -1090,15 +1090,7 @@ flowchart TD
         end
 
         subgraph S_SPEECH["Speech Verification Service (GPU EC2)"]
-            direction LR
-            Ingest["Приём аудио"]
-            Decoder["Декодер libopus<br/>→ PCM"]
-            Spectro["Спектрограмма<br/>log-mel 80"]
-            Conformer["Conformer-CTC<br/>TensorRT FP16"]
-            GoPAlign["Forced alignment<br/>+ GoP"]
-            Sampler["Сэмплер 0,5%<br/>99,5% стирается в RAM"]
-            ScyllaSpeech[("ScyllaDB Speech<br/>speech_samples, TTL 90d")]
-            S3Speech[("S3 Speech<br/>записи речи, TTL 90d")]
+            SpeechGPU["Conformer-CTC + GoP (TensorRT FP16)<br/>99,5% стирается в RAM"]
         end
 
         subgraph S_EVENTS["Events Service — фронтовые события"]
@@ -1128,15 +1120,15 @@ flowchart TD
         HLRTrainer["HLR-тренер (домен Progress)<br/>ежедневно, Spark / PyTorch"]
         MistakesBuilder["Mistakes builder (домен Progress)<br/>near-line из DWH"]
         SpeechArchiver["Speech Archiver (домен Speech)"]
+        ScyllaSpeech[("ScyllaDB Speech<br/>speech_samples, TTL 90d")]
+        S3Speech[("S3 Speech<br/>записи речи, TTL 90d")]
         LeagueFinalizer["League Finalizer (домен Gamification)<br/>недельный"]
     end
 
     %% ===== Наблюдаемость (обособлена) =====
     subgraph S_OBS["Контур наблюдаемости"]
         OtelAgent["OTel Collector + Vector<br/>(DaemonSet, буфер на ноде)"]
-        VicMetrics[("VictoriaMetrics<br/>метрики")]
-        Loki[("Grafana Loki<br/>логи")]
-        Tempo[("Grafana Tempo<br/>трейсы")]
+        ObsStore[("VictoriaMetrics / Loki / Tempo<br/>метрики, логи, трейсы")]
         Grafana["Grafana + Alertmanager<br/>дашборды / алерты"]
     end
 
@@ -1199,12 +1191,7 @@ flowchart TD
     Indexer -->|"W (индекс)"| OpenSearch
 
     %% ===== Speech =====
-    Ingest --> Decoder
-    Decoder --> Spectro
-    Spectro --> Conformer
-    Conformer --> GoPAlign
-    GoPAlign --> Sampler
-    Sampler -->|"0,5%"| T_SPEECH
+    SpeechGPU -->|"0,5%"| T_SPEECH
 
     %% ===== Events =====
     EventsAPI --> T_FRONT
@@ -1227,19 +1214,15 @@ flowchart TD
     %% ===== Телеметрия =====
     S_ONLINE -.-> OtelAgent
     S_OFFLINE -.-> OtelAgent
-    OtelAgent --> VicMetrics
-    OtelAgent --> Loki
-    OtelAgent --> Tempo
-    VicMetrics --> Grafana
-    Loki --> Grafana
-    Tempo --> Grafana
+    OtelAgent --> ObsStore
+    ObsStore --> Grafana
 ```
 
 ---
 
 ### 10.2 Пояснения к схеме
 
-**Сервисы и хранилища.** Онлайн-контур — 8 сервисов; у каждого своя зона ответственности и свои хранилища (одна БД сервиса = один кубик, стрелки помечены R/W). Auth отделён от Users: аккаунты/пароли/сессии против профиля/настроек; между ними асинхронная инвалидация (`auth_events` / `account_events`).
+**Сервисы и хранилища.** Онлайн-контур — 8 сервисов; у каждого своя зона ответственности и свои хранилища (одна БД сервиса = один кубик, стрелки помечены R/W). Исключение — Speech: онлайн-конвейер не хранит состояние, архив сэмплов (S3 + Scylla) — в оффлайн-контуре у Archiver. Auth отделён от Users: аккаунты/пароли/сессии против профиля/настроек; между ними асинхронная инвалидация (`auth_events` / `account_events`).
 
 **API-композиции — в сервисах-владельцах, не в Gateway.** Users собирает главную (Gamification + Progress), Progress — урок и Practice Hub (Content + Gamification + HLR), Gamification — лидерборд (Users). API Gateway делает только маршрутизацию и authN (проверка токена через Auth → Redis Sessions); трафик через него подразумевается, поэтому на схеме одна стрелка, а зависимости — напрямую сервис → сервис. Speech идёт напрямую от Ingress, минуя Gateway (изоляция тяжёлого GPU-потока от Core API).
 

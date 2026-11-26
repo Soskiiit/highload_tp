@@ -1180,8 +1180,12 @@ flowchart TD
         LeagueFinalizer["League Finalizer (Gamification)<br/>недельный"]
     end
 
-    %% ===== Наблюдаемость: один узел-аннотация, стек в §8 =====
-    Obs["Наблюдаемость (§8)<br/>OTel с обоих контуров → VM / Loki / Tempo → Grafana"]
+    %% ===== Наблюдаемость (обособлена, внизу) =====
+    subgraph S_OBS["Контур наблюдаемости (§8)"]
+        OtelAgent["OTel Collector + Vector<br/>DaemonSet, буфер на ноде"]
+        ObsStore[("VM / Loki / Tempo<br/>метрики, логи, трейсы")]
+        Grafana["Grafana + Alertmanager<br/>дашборды / алерты"]
+    end
 
     %% ===== Клиентский трафик =====
     Mobile --> Ingress
@@ -1256,27 +1260,31 @@ flowchart TD
     SpeechArchiver -->|"метаданные"| ScyllaSpeech
     LeagueFinalizer -->|"R/W (когорты)"| RedisGamif
 
+    %% ===== Телеметрия =====
+    S_ONLINE -.-> OtelAgent
+    S_OFFLINE -.-> OtelAgent
+    OtelAgent --> ObsStore
+    ObsStore --> Grafana
+
     %% ===== Раскраска по типам узлов =====
     classDef api fill:#e8f0fe,stroke:#4a6fa5,color:#1a2b45
     classDef worker fill:#f3e8fd,stroke:#8a5fb0,color:#3a2352
     classDef store fill:#fdf3e0,stroke:#c99a3c,color:#4a3a15
     classDef topic fill:#e6f4ea,stroke:#4c9a63,color:#1e3d2a
     classDef infra fill:#eceff1,stroke:#78909c,color:#263238
-    classDef obs fill:#eceff1,stroke:#78909c,stroke-dasharray:5 5,color:#263238
 
     class AuthAPI,UsersAPI,LessonAPI,GamifAPI,ContentAPI,PublishAPI,SearchAPI,EventsAPI,SpeechGPU api
     class HLRRanker,MediaWorker,Indexer,DWH,HLRTrainer,MistakesBuilder,SpeechArchiver,LeagueFinalizer worker
-    class PostgresAuth,RedisSessions,PostgresUsers,UsersCache,LessonCache,ScyllaProgress,RedisGamif,ScyllaGamif,PostgresContent,S3Content,OpenSearch,ClickHouse,ScyllaSpeech,S3Speech store
+    class PostgresAuth,RedisSessions,PostgresUsers,UsersCache,LessonCache,ScyllaProgress,RedisGamif,ScyllaGamif,PostgresContent,S3Content,OpenSearch,ClickHouse,ScyllaSpeech,S3Speech,ObsStore store
     class T_AUTH,T_ACCOUNT,T_LESSON,T_CONTENT,T_SPEECH,T_FRONT topic
-    class Mobile,Web,CDN,Ingress,APIGW infra
-    class Obs obs
+    class Mobile,Web,CDN,Ingress,APIGW,OtelAgent,Grafana infra
 ```
 
 ---
 
 ### 10.2 Пояснения к схеме
 
-**Сервисы и хранилища.** Онлайн-контур — 8 сервисов; у каждого своя зона ответственности и свои хранилища (одна БД сервиса = один кубик, стрелки помечены R/W). Консьюмеры и outbox relay свёрнуты в узлы сервисов (семантика — в подписях); наблюдаемость показана одним узлом, стек — §8. Исключение — Speech: онлайн-конвейер не хранит состояние, архив сэмплов (S3 + Scylla) — в оффлайн-контуре у Archiver. Auth отделён от Users: аккаунты/пароли/сессии против профиля/настроек; между ними асинхронная инвалидация (`auth_events` / `account_events`).
+**Сервисы и хранилища.** Онлайн-контур — 8 сервисов; у каждого своя зона ответственности и свои хранилища (одна БД сервиса = один кубик, стрелки помечены R/W). Консьюмеры и outbox relay свёрнуты в узлы сервисов (семантика — в подписях); контур наблюдаемости — обособленная группа внизу схемы, стек — §8. Исключение — Speech: онлайн-конвейер не хранит состояние, архив сэмплов (S3 + Scylla) — в оффлайн-контуре у Archiver. Auth отделён от Users: аккаунты/пароли/сессии против профиля/настроек; между ними асинхронная инвалидация (`auth_events` / `account_events`).
 
 **API-композиции — в сервисах-владельцах, не в Gateway.** Users собирает главную (Gamification + Progress; при отказе Gamification — последние счётчики из кэша, §9.2), Progress — урок и Practice Hub (Content + Gamification + HLR), Gamification — лидерборд (Users). API Gateway делает только маршрутизацию и authN (проверка токена через Auth → Redis Sessions); трафик через него подразумевается, поэтому на схеме одна стрелка, а зависимости — напрямую сервис → сервис. Speech идёт напрямую от Ingress, минуя Gateway (изоляция тяжёлого GPU-потока от Core API).
 

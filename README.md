@@ -1054,17 +1054,37 @@ Conformer-CTC + GoP: один параллельный проход (SLA), фо�
 * **Приём:** TTS-файлы immutable по content-hash (TTL 24 ч на Edge), клиент дополнительно кэширует прослушанное в SQLite. При отказе S3/origin аудио продолжает воспроизводиться из stale-кэша CDN и локального кэша.
 * **Эффект:** эталонная речь доступна; новые фразы синтезируются после восстановления (Media-воркер догоняет очередь `content_events`).
 
+#### Приём 4. Частичный ответ композиции: главная без свежей геймификации
+
+* **Стрелка на схеме:** существующая `UsersAPI → UsersCache (R/W)` — запись последних успешных счётчиков и fallback-чтение в одной ветке (как у кэша уроков, приём 2).
+* **Норма:** Users собирает главную (`GET /user/progress`, пик 4 270 RPS, §2.3.3): профиль (свой кэш / PG) + прогресс курсов (Lessons) + XP / gems / streak (Gamification). Внутренние вызовы — с дедлайном ≤ 50 мс (§9.1).
+* **Проблема:** отказ Gamification API или его Scylla (приём 1 закрывает только отказ Redis внутри сервиса): circuit breaker размыкается, вызов отклоняется. Без защиты композиция возвращает ошибку, и главная — самый частый вход в приложение (~4 открытия/сутки, §2.1) — становится «пустым экраном».
+* **Приём (partial response):** при каждой успешной сборке Users сохраняет последние XP / gems / streak в кэше профиля. При разомкнутом breaker главная собирается с последними известными счётчиками, прогресс курсов — из Lessons как обычно; если снимка нет (новый пользователь), блок геймификации скрывается, а не блокирует страницу. Опциональная зависимость деградирует, а не весь ответ.
+* **Эффект:** главная и обучение работают; счётчики заморожены на последней успешной сборке (часы — главная открывается ~4 раза/сутки), после восстановления свежие. Это второй эшелон защиты: отказ Redis внутри Gamification гасится приёмом 1 (ledger), отказ самого сервиса — частичным ответом здесь.
+* **Цена:** ~100 Б на пользователя в кэше профиля; устаревшие XP / streak на время отказа.
+
+#### Приём 5. Фолбэк поиска на каталог при отказе OpenSearch
+
+* **Стрелка на схеме:** новая пунктирная `SearchAPI -.-> ContentAPI (fallback: каталог)` — деградационный путь.
+* **Норма:** Search читает `courses_search_index` в OpenSearch — BM25-ранжирование и нечёткость по опечаткам (пик 2 135 RPS, §6); индекс обновляет Indexer через `content_events`.
+* **Проблема:** отказ OpenSearch: поиск курсов отдаёт ошибку, пользователь не может найти курс — при живом каталоге в Content DB.
+* **Приём:** circuit breaker размыкается, SearchAPI запрашивает каталог у ContentAPI (250+ курсов, §6; рабочая выборка в RAM PostgreSQL Content) и фильтрует по названию / префиксу. Без BM25 и опечаточной нечёткости — менее точно, но не пустой экран.
+* **Эффект:** поиск работает на время отказа; фолбэк — точечные чтения маленькой таблицы (~2 000 запросов/с на ядро, §11.1), Content не перегружается. Каталог из Content DB даже свежее индекса (нет лага `content_events`). После восстановления — возврат к полнотекстовому поиску.
+* **Цена:** потеря ранжирования / нечёткости на время отказа; дополнительная нагрузка на Content API только в режиме деградации.
+
 #### Сводная таблица деградаций
 
 | Отказ | Детектирование | Что получает пользователь | Стрелка на схеме | Свежесть данных |
 |---|---|---|---|---|
 | Redis Gamification | Circuit breaker, health-check | Приближённые лидерборд / XP / streak из ledger | `GamifAPI -.-> ScyllaGamif` | Лаг консьюмера (секунды) |
+| Gamification API / Scylla Gamif | Circuit breaker, таймаут 50 мс | Главная с последними XP / streak из кэша профиля | `UsersAPI → UsersCache (R/W)` | Последняя успешная сборка (часы) |
 | Scylla Progress / HLR / θ | Таймаут 25 мс, circuit breaker | Кэшированный / статический урок | `LessonAPI → LessonCache` | Последняя успешная сборка |
 | S3 Content / origin | Health-check CDN | Stale-аудио + клиентский кэш | `CDN -.-> S3Content` (stale) | TTL 24 ч |
+| OpenSearch | Circuit breaker, health-check | Поиск по каталогу без нечёткости / BM25 | `SearchAPI -.-> ContentAPI` | Каталог Content DB, без лага индекса |
 | Speech GPU | `/healthz`, circuit breaker | Упражнение без проверки произношения, без штрафа | — (продуктовое решение) | — |
-| Kafka | Буфер продюсера, outbox | Ничего не теряется: события копятся в outbox / на клиенте | `Outbox relay → lesson_submitted` | Догон после восстановления |
+| Kafka | Буфер продюсера, outbox | Ничего не теряется: события копятся в outbox / на клиенте | `LessonAPI (outbox relay) → lesson_submitted` | Догон после восстановления |
 
-Переключение режимов выполняется автоматически (пороги circuit breaker Envoy), наблюдаемость — через обособленный контур (§10.1): алерты Alertmanager, дашборды Grafana. Деградация не смешивается с бизнес-DWH и не зависит от его доступности.
+Переключение режимов выполняется автоматически (пороги circuit breaker Envoy), наблюдаемость — через обособленный контур (§8): алерты Alertmanager, дашборды Grafana. Деградация не смешивается с бизнес-DWH и не зависит от его доступности.
 
 ---
 
@@ -1076,112 +1096,99 @@ Conformer-CTC + GoP: один параллельный проход (SLA), фо�
 flowchart TD
     %% ===== Клиенты =====
     subgraph S_CLIENT["Клиенты"]
-        Mobile["Мобильный клиент (KMP)<br/>+ локальный SQLite-кэш"]
+        Mobile["Мобильный клиент (KMP)<br/>+ SQLite-кэш"]
         Web["Веб-клиент (React SPA)"]
     end
 
     %% ===== Периметр (свёрнут до минимума) =====
     subgraph S_EDGE["Периметр и маршрутизация"]
         CDN["Edge CDN (CloudFront)<br/>media / static"]
-        Ingress["L4 IPVS + L7 Nginx<br/>(TLS, WAF)"]
-        APIGW["API Gateway (BFF, Go)<br/>маршрутизация + authN,<br/>бизнес-композиция — в сервисах"]
+        Ingress["L4 IPVS + L7 Nginx<br/>TLS, WAF"]
+        APIGW["API Gateway (BFF, Go)<br/>маршрутизация + authN"]
     end
 
     %% ===== Онлайн-контур =====
     subgraph S_ONLINE["ОНЛАЙН-КОНТУР (Kubernetes EKS)"]
 
-        subgraph S_AUTH["Auth Service — аккаунты и сессии"]
-            AuthAPI["Auth API<br/>регистрация / login / токены"]
-            AuthConsumer["Консьюмер account_events<br/>инвалидация сессий"]
-            PostgresAuth[("PostgreSQL Auth DB<br/>аккаунты, password_hash")]
+        subgraph S_AUTH["Auth — аккаунты и сессии"]
+            AuthAPI["Auth API: регистрация / login / токены<br/>+ консьюмер account_events: инвалидация сессий"]
+            PostgresAuth[("PostgreSQL Auth<br/>аккаунты, password_hash")]
             RedisSessions[("Redis Sessions<br/>sess:token, TTL 30d")]
         end
 
-        subgraph S_USERS["Users Service — профили"]
-            UsersAPI["Users API + композиция<br/>GET /user/progress (главная)"]
-            UsersCache["Кэш профиля (local)"]
-            UsersConsumer["Консьюмер auth_events<br/>инвалидация кэша / удаление"]
-            PostgresUsers[("PostgreSQL Users DB<br/>профиль, настройки, локаль")]
+        subgraph S_USERS["Users — профили"]
+            UsersAPI["Users API + композиция главной<br/>+ консьюмер auth_events: инвалидация / удаление"]
+            UsersCache["Кэш профиля (local)<br/>+ последние XP / streak"]
+            PostgresUsers[("PostgreSQL Users<br/>профиль, настройки, локаль")]
         end
 
-        subgraph S_PROGRESS["Progress & Practice Service — уроки, HLR"]
-            LessonAPI["Lessons API + композиция<br/>GET /lessons/:id, /review/mistakes<br/>POST /submit (tx + outbox)"]
-            HLRRanker["HLR-ранжер / feature store (CPU)<br/>фичи из mistakes, веса θ,<br/>min-heap Top-K"]
-            OutboxRelay["Outbox relay"]
-            LessonCache["Fallback-кэш уроков<br/>последняя сборка + статический набор"]
-            ScyllaProgress[("ScyllaDB Progress<br/>progress, mistakes, θ, outbox<br/>partition key: user_id")]
+        subgraph S_PROGRESS["Progress & Practice — уроки, HLR"]
+            LessonAPI["Lessons API + композиция<br/>+ outbox relay (POST /submit)"]
+            HLRRanker["HLR-ранжер (CPU)<br/>mistakes, θ, Top-K"]
+            LessonCache["Fallback-кэш уроков<br/>последняя сборка + статика"]
+            ScyllaProgress[("ScyllaDB Progress<br/>progress, mistakes, θ, outbox")]
         end
 
-        subgraph S_GAMIF["Gamification & Leagues Service"]
-            GamifAPI["Leaderboard API + композиция<br/>GET /leaderboard, /user/gamification"]
-            GamifConsumer["Консьюмер lesson_submitted<br/>XP / streak / лиги"]
-            RedisGamif[("Redis Gamification<br/>gamif HASH (HINCRBY)<br/>league ZSET (ZADD)")]
-            ScyllaGamif[("ScyllaDB Gamification<br/>xp_ledger (durable, RPO=0)")]
+        subgraph S_GAMIF["Gamification & Leagues"]
+            GamifAPI["Leaderboard API + композиция<br/>+ консьюмер lesson_submitted: XP / streak / лиги"]
+            RedisGamif[("Redis Gamification<br/>gamif HASH, league ZSET")]
+            ScyllaGamif[("ScyllaDB Gamification<br/>xp_ledger, RPO=0")]
         end
 
-        subgraph S_CONTENT["Course Content Service"]
+        subgraph S_CONTENT["Course Content"]
             ContentAPI["Content API<br/>каталог / уроки / упражнения"]
-            PublishAPI["Publish API + outbox relay<br/>публикация контента"]
-            MediaWorker["Media-воркер<br/>TTS (Amazon Polly) + статика"]
-            PostgresContent[("PostgreSQL Content DB<br/>courses…exercises, tts_audio,<br/>static_assets, outbox")]
+            PublishAPI["Publish API + outbox relay"]
+            MediaWorker["Media-воркер<br/>TTS (Polly) + статика"]
+            PostgresContent[("PostgreSQL Content<br/>courses…exercises, tts, outbox")]
             S3Content[("S3 Content<br/>TTS Opus + статика")]
         end
 
-        subgraph S_SEARCH["Search Service"]
-            SearchAPI["Search API<br/>GET /courses (поиск)"]
+        subgraph S_SEARCH["Search"]
+            SearchAPI["Search API (поиск курсов)"]
             Indexer["Воркер-индексатор"]
             OpenSearch[("OpenSearch<br/>courses_search_index")]
         end
 
-        subgraph S_SPEECH["Speech Verification Service (GPU EC2)"]
+        subgraph S_SPEECH["Speech Verification (GPU EC2)"]
             SpeechGPU["Conformer-CTC + GoP (TensorRT FP16)<br/>99,5% стирается в RAM"]
         end
 
-        subgraph S_EVENTS["Events Service — фронтовые события"]
-            EventsAPI["Events API<br/>POST /events (батчи)<br/>валидация / обогащение"]
+        subgraph S_EVENTS["Events — фронтовые события"]
+            EventsAPI["Events API<br/>батчи, валидация / обогащение"]
         end
     end
 
     %% ===== Событийная шина (обособлена) =====
-    subgraph S_KAFKA["Событийная шина — Apache Kafka (KRaft)"]
-        T_AUTH["auth_events"]
-        T_ACCOUNT["account_events"]
-        T_LESSON["lesson_submitted"]
-        T_CONTENT["content_events"]
-        T_SPEECH["speech_raw"]
-        T_FRONT["frontend_events"]
+    subgraph S_KAFKA["Событийная шина — Kafka (KRaft)"]
+        T_AUTH(["auth_events"])
+        T_ACCOUNT(["account_events"])
+        T_LESSON(["lesson_submitted"])
+        T_CONTENT(["content_events"])
+        T_SPEECH(["speech_raw"])
+        T_FRONT(["frontend_events"])
     end
 
     %% ===== Оффлайн-контур =====
     subgraph S_OFFLINE["ОФФЛАЙН / NEAR-LINE КОНТУР"]
-
-        subgraph S_DWH["DWH / Analytics Service"]
-            DWHConsumer["DWH-консьюмер<br/>батчи 20–50k строк"]
-            Reconcile["Сверка front ↔ back<br/>+ ML-витрины"]
-            ClickHouse[("ClickHouse<br/>dwh_events")]
-        end
-
-        HLRTrainer["HLR-тренер (домен Progress)<br/>ежедневно, Spark / PyTorch"]
-        MistakesBuilder["Mistakes builder (домен Progress)<br/>near-line из DWH"]
-        SpeechArchiver["Speech Archiver (домен Speech)"]
+        DWH["DWH-консьюмер + сверка front ↔ back<br/>батчи 20–50k, ML-витрины"]
+        ClickHouse[("ClickHouse<br/>dwh_events")]
+        HLRTrainer["HLR-тренер (Progress)<br/>ежедневно, Spark / PyTorch"]
+        MistakesBuilder["Mistakes builder (Progress)<br/>near-line из DWH"]
+        SpeechArchiver["Speech Archiver"]
         ScyllaSpeech[("ScyllaDB Speech<br/>speech_samples, TTL 90d")]
         S3Speech[("S3 Speech<br/>записи речи, TTL 90d")]
-        LeagueFinalizer["League Finalizer (домен Gamification)<br/>недельный"]
+        LeagueFinalizer["League Finalizer (Gamification)<br/>недельный"]
     end
 
-    %% ===== Наблюдаемость (обособлена) =====
-    subgraph S_OBS["Контур наблюдаемости"]
-        OtelAgent["OTel Collector + Vector<br/>(DaemonSet, буфер на ноде)"]
-        ObsStore[("VictoriaMetrics / Loki / Tempo<br/>метрики, логи, трейсы")]
-        Grafana["Grafana + Alertmanager<br/>дашборды / алерты"]
-    end
+    %% ===== Наблюдаемость: один узел, стек в §8 =====
+    Obs["Наблюдаемость (§8)<br/>OTel → VM / Loki / Tempo → Grafana"]
 
     %% ===== Клиентский трафик =====
     Mobile --> Ingress
     Web --> Ingress
     Mobile --> CDN
     Web --> CDN
-    CDN -.->|"origin miss (R)"| S3Content
+    CDN -.->|"origin miss"| S3Content
     Ingress --> APIGW
     Ingress -->|"speech/*"| S_SPEECH
 
@@ -1192,83 +1199,90 @@ flowchart TD
     AuthAPI -->|"R/W"| PostgresAuth
     AuthAPI -->|"R/W"| RedisSessions
     AuthAPI -->|"logout, pwd"| T_AUTH
-    T_ACCOUNT --> AuthConsumer
+    T_ACCOUNT --> AuthAPI
 
     %% ===== Users =====
     UsersAPI -->|"R/W"| UsersCache
     UsersAPI -->|"R/W"| PostgresUsers
-    UsersAPI -->|"R: XP / gems / streak"| GamifAPI
-    UsersAPI -->|"R: прогресс курсов"| LessonAPI
+    UsersAPI -->|"XP / gems / streak"| GamifAPI
+    UsersAPI -->|"прогресс курсов"| LessonAPI
     UsersAPI -->|"delete, email"| T_ACCOUNT
-    T_AUTH --> UsersConsumer
-    UsersConsumer -->|"W (удаление профиля)"| PostgresUsers
+    T_AUTH --> UsersAPI
 
     %% ===== Progress & Practice =====
     LessonAPI --> HLRRanker
-    LessonAPI -->|"R/W (progress + outbox)"| ScyllaProgress
-    HLRRanker -->|"R (mistakes, θ)"| ScyllaProgress
-    OutboxRelay -->|"R (outbox)"| ScyllaProgress
-    OutboxRelay --> T_LESSON
-    LessonAPI -->|"R: контент упражнений"| ContentAPI
-    LessonAPI -->|"R: hearts / лимиты"| GamifAPI
+    LessonAPI -->|"R/W"| ScyllaProgress
+    HLRRanker -->|"mistakes, θ"| ScyllaProgress
+    LessonAPI -->|"outbox"| T_LESSON
+    LessonAPI -->|"контент упражнений"| ContentAPI
+    LessonAPI -->|"hearts / лимиты"| GamifAPI
     LessonAPI -->|"R/W"| LessonCache
 
     %% ===== Gamification & Leagues =====
-    T_LESSON --> GamifConsumer
-    GamifConsumer -->|"W (ledger upsert)"| ScyllaGamif
+    T_LESSON --> GamifAPI
+    GamifAPI -->|"W (ledger)"| ScyllaGamif
     GamifAPI -->|"R/W"| RedisGamif
-    GamifAPI -.->|"fallback R (отказ Redis)"| ScyllaGamif
-    GamifAPI -->|"R: профили Top-30"| UsersAPI
+    GamifAPI -.->|"fallback R"| ScyllaGamif
+    GamifAPI -->|"профили Top-30"| UsersAPI
 
     %% ===== Content =====
     ContentAPI -->|"R"| PostgresContent
-    PublishAPI -->|"W (контент + outbox)"| PostgresContent
+    PublishAPI -->|"W + outbox"| PostgresContent
     PublishAPI --> T_CONTENT
     T_CONTENT --> MediaWorker
-    MediaWorker -->|"W (аудио / ассеты)"| S3Content
-    MediaWorker -->|"W (метаданные)"| PostgresContent
-    MediaWorker -.->|"push / invalidate"| CDN
+    MediaWorker -->|"аудио / ассеты"| S3Content
+    MediaWorker -->|"метаданные"| PostgresContent
+    MediaWorker -.->|"invalidate"| CDN
 
     %% ===== Search =====
     SearchAPI -->|"R"| OpenSearch
+    SearchAPI -.->|"fallback: каталог"| ContentAPI
     T_CONTENT --> Indexer
     Indexer -->|"W (индекс)"| OpenSearch
 
-    %% ===== Speech =====
+    %% ===== Speech / Events =====
     SpeechGPU -->|"0,5%"| T_SPEECH
-
-    %% ===== Events =====
     EventsAPI --> T_FRONT
 
-    %% ===== Оффлайн: DWH =====
-    S_KAFKA -->|"все топики"| DWHConsumer
-    DWHConsumer -->|"W (батчи)"| ClickHouse
-    Reconcile -->|"R"| ClickHouse
-
-    %% ===== Оффлайн: тренеры и воркеры =====
+    %% ===== Оффлайн: DWH, тренеры и воркеры =====
+    S_KAFKA -->|"все топики"| DWH
+    DWH -->|"R/W (батчи + сверка)"| ClickHouse
     HLRTrainer -->|"R"| ClickHouse
     HLRTrainer -->|"W (θ)"| ScyllaProgress
     MistakesBuilder -->|"R"| ClickHouse
-    MistakesBuilder -->|"W (user_mistakes)"| ScyllaProgress
+    MistakesBuilder -->|"W (mistakes)"| ScyllaProgress
     T_SPEECH --> SpeechArchiver
-    SpeechArchiver -->|"W (аудио)"| S3Speech
-    SpeechArchiver -->|"W (метаданные)"| ScyllaSpeech
-    LeagueFinalizer -->|"R/W (финализация когорт)"| RedisGamif
+    SpeechArchiver -->|"аудио"| S3Speech
+    SpeechArchiver -->|"метаданные"| ScyllaSpeech
+    LeagueFinalizer -->|"R/W (когорты)"| RedisGamif
 
     %% ===== Телеметрия =====
-    S_ONLINE -.-> OtelAgent
-    S_OFFLINE -.-> OtelAgent
-    OtelAgent --> ObsStore
-    ObsStore --> Grafana
+    S_ONLINE -.-> Obs
+    S_OFFLINE -.-> Obs
+
+    %% ===== Раскраска по типам узлов =====
+    classDef api fill:#e8f0fe,stroke:#4a6fa5,color:#1a2b45
+    classDef worker fill:#f3e8fd,stroke:#8a5fb0,color:#3a2352
+    classDef store fill:#fdf3e0,stroke:#c99a3c,color:#4a3a15
+    classDef topic fill:#e6f4ea,stroke:#4c9a63,color:#1e3d2a
+    classDef infra fill:#eceff1,stroke:#78909c,color:#263238
+    classDef obs fill:#eceff1,stroke:#78909c,stroke-dasharray:5 5,color:#263238
+
+    class AuthAPI,UsersAPI,LessonAPI,GamifAPI,ContentAPI,PublishAPI,SearchAPI,EventsAPI,SpeechGPU api
+    class HLRRanker,MediaWorker,Indexer,DWH,HLRTrainer,MistakesBuilder,SpeechArchiver,LeagueFinalizer worker
+    class PostgresAuth,RedisSessions,PostgresUsers,UsersCache,LessonCache,ScyllaProgress,RedisGamif,ScyllaGamif,PostgresContent,S3Content,OpenSearch,ClickHouse,ScyllaSpeech,S3Speech store
+    class T_AUTH,T_ACCOUNT,T_LESSON,T_CONTENT,T_SPEECH,T_FRONT topic
+    class Mobile,Web,CDN,Ingress,APIGW infra
+    class Obs obs
 ```
 
 ---
 
 ### 10.2 Пояснения к схеме
 
-**Сервисы и хранилища.** Онлайн-контур — 8 сервисов; у каждого своя зона ответственности и свои хранилища (одна БД сервиса = один кубик, стрелки помечены R/W). Исключение — Speech: онлайн-конвейер не хранит состояние, архив сэмплов (S3 + Scylla) — в оффлайн-контуре у Archiver. Auth отделён от Users: аккаунты/пароли/сессии против профиля/настроек; между ними асинхронная инвалидация (`auth_events` / `account_events`).
+**Сервисы и хранилища.** Онлайн-контур — 8 сервисов; у каждого своя зона ответственности и свои хранилища (одна БД сервиса = один кубик, стрелки помечены R/W). Консьюмеры и outbox relay свёрнуты в узлы сервисов (семантика — в подписях); наблюдаемость показана одним узлом, стек — §8. Исключение — Speech: онлайн-конвейер не хранит состояние, архив сэмплов (S3 + Scylla) — в оффлайн-контуре у Archiver. Auth отделён от Users: аккаунты/пароли/сессии против профиля/настроек; между ними асинхронная инвалидация (`auth_events` / `account_events`).
 
-**API-композиции — в сервисах-владельцах, не в Gateway.** Users собирает главную (Gamification + Progress), Progress — урок и Practice Hub (Content + Gamification + HLR), Gamification — лидерборд (Users). API Gateway делает только маршрутизацию и authN (проверка токена через Auth → Redis Sessions); трафик через него подразумевается, поэтому на схеме одна стрелка, а зависимости — напрямую сервис → сервис. Speech идёт напрямую от Ingress, минуя Gateway (изоляция тяжёлого GPU-потока от Core API).
+**API-композиции — в сервисах-владельцах, не в Gateway.** Users собирает главную (Gamification + Progress; при отказе Gamification — последние счётчики из кэша, §9.2), Progress — урок и Practice Hub (Content + Gamification + HLR), Gamification — лидерборд (Users). API Gateway делает только маршрутизацию и authN (проверка токена через Auth → Redis Sessions); трафик через него подразумевается, поэтому на схеме одна стрелка, а зависимости — напрямую сервис → сервис. Speech идёт напрямую от Ingress, минуя Gateway (изоляция тяжёлого GPU-потока от Core API).
 
 **Фронтовые события.** Events-сервис принимает события клиента — что он реально увидел/прослушал (бэкенд этого не знает) — и пишет в `frontend_events`; клиент не ходит в Kafka напрямую. Бэкендовые события — отдельные топики; сверка front ↔ back выполняется в DWH.
 

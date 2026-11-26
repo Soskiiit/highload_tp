@@ -158,6 +158,10 @@
 2. **Локальный пиковый коэффициент ДЦ ($K_{peak}^{local} = 2{,}8$)**:
    В пределах одного региона пользователи находятся в близких часовых поясах, формируя вечерний пик (19:00–22:00) с локальным коэффициентом $K_{peak}^{local} \approx 2{,}8$.
 
+![Суточный ход нагрузки: сумма региональных кривых и глобальный пик 1,75× среднего](images/global_peak.svg)
+
+Глобальный максимум **$1{,}75\times$ среднего** возникает около **01:30 UTC** при наложении вечерних пиков США и Латинской Америки (суммарно 55% DAU), тогда как разнесённые по времени пики Европы (20:00 UTC, $1{,}42\times$) и APAC (15:30 UTC, $1{,}21\times$) взаимно сглаживают суммарную кривую относительно локального пика $2{,}8\times$. Суточная форма кривой согласована с эмпирическим распределением времени пользователей Duolingo по данным Ipsos iris [[42]](#source42) (доля «вечер + ночь» 52% в исследовании против 52,2% в модели).
+
 **Архитектурное следствие**:
 * Централизованные хранилища и магистральные каналы рассчитываются по $K_{peak}^{global} = 1{,}75$.
 * Вычислительные мощности региональных ДЦ используют автоскейлинг (AWS ASG), масштабируясь под локальный пик $K_{peak}^{local} = 2{,}8$ и снижая ёмкость до 70% ночью.
@@ -1577,3 +1581,4 @@ $$\text{Удельная стоимость} = \frac{\$148\,255}{52{,}7 \text{ �
 39. <a id="source39"></a>[NVIDIA A10 24GB Refurbished / Enterprise (Request Quote; вторичный рынок $2 400–$3 600) — ServerMonkey](https://www.servermonkey.com)
 40. <a id="source40"></a>[Supermicro AS-4125GS-TNRT: 4U 8-GPU-сервер (2× EPYC 9004/SP5, barebone ~$14 700–$15 500+, Request Quote) — Supermicro eStore](https://store.supermicro.com/us_en/systems/a-systems/4u-gpu-superserver-amd-epyc-genoa-as-4125gs-tnrt.html)
 41. <a id="source41"></a>[AMD EPYC 9354 (32-Core, SP5, $2 688,99 на CDW; рынок $1 600–$3 000) — CDW](https://www.cdw.com/search/?key=EPYC+9354) / [Newegg](https://www.newegg.com/p/pl?d=AMD+EPYC+9354)
+42. <a id="source42"></a>[Of the top 100 apps, Duolingo has the highest proportion of time spent in the late peak and late night — Ipsos iris](https://iris.ipsos.com/duolingo-daypart-analysis/)

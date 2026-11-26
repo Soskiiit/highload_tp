@@ -1386,6 +1386,25 @@ flowchart TD
 
 Выбран AWS во всех 5 регионах (§3.2): bare-metal не покрывает Бразилию (17% DAU, RTT < 35 мс), а гибрид «bare-metal + AWS только в Бразилии» экономит на 4 регионах ценой двух сетей и двух IaC-контуров. Архитектура уже опирается на managed AWS — CloudFront (§3.5), Route 53 (§3.4), Polly (§7, [10]), G5 под TensorRT (§7.2); их замена — перепроектирование §§3, 7, а не смена хостинга. Ценовой разрыв сокращают Savings Plans 1 год (−30% на baseline [24]) и spot (−65% на оффлайн/CI); при этом 63% итогового счёта (§11.6) — CDN/WAF/DNS, которые от смены хостинга compute не дешевеют.
 
+#### Расчёт закупки, размещения и окупаемости собственного оборудования
+
+Для проверки рациональности выбора облака сопоставим базлайн AWS (§11.5–11.6) с размещением собственного железа в колокации ($210–400/кВт·мес по регионам при PUE 1,5 [34], [35]; базовый серверный узел: 4 GPU + EPYC 9354, 256 ГБ RAM, NVMe, 2×25GbE ≈ $7 500 на базе шасси Supermicro SP5 $3 500–$6 000 [40] и CPU $1 600–$3 000 [41]; карта A10 24 ГБ refurb ≈ $2 200–$2 500 [39], new на ритейле от ~$3 000 [38]):
+
+| Вариант | Конфигурация | Закупка (CAPEX) | Размещение и OPEX, $/мес | TCO (с аморт. 48 мес), $/мес | Окупаемость vs AWS |
+|---|---|---|---|---|---|
+| **AWS compute + диски** (базлайн, §11.5–11.6) | 126 инстансов + 35,5 ТБ EBS | $0 | 48 990 | 48 990 | — |
+| **Полный вынос compute** | 11 CPU-узлов + 22 storage + 24 GPU + сеть | $689 300 | 49 316 | 63 676 | **не окупается** ($\Delta_{cash} = -326$/мес) |
+| **AWS только GPU** (`g5.2xlarge` + SP) | 24 × A10G | $0 | 16 647 | 16 647 | — |
+| **Свой GPU-контур (A10 refurb)** | 24 карты, 7 узлов (N+1 по 5 ДЦ) | $105 300 | 10 477 | 12 670 | **17,1 мес** |
+| **Гибрид GPU (свой baseline + AWS)** | 7 × A10 refurb (3 узла US/EU) + burst AWS | $30 400 | 13 281 *(11 937 при burst 4–6 ч)* | 13 914 | **9,0 мес** *(6,5 мес)* |
+
+- **Почему не выносим весь compute:** ежемесячный cash OPEX своего парка ($49 316/мес, из них $30 тыс./мес — 3 FTE персонала на 5 регионов, плюс колокация, сеть и ЗИП) превышает затраты на compute и диски в AWS ($48 990/мес) ещё до учёта амортизации железа.
+- **GPU-контур (расчёт окупаемости):** структура OPEX для 24 × A10 refurb — колокация $2 538 (6,4 кВт IT) + ЗИП $439 + сеть $1 500 + персонал (0,5 FTE) $6 000 = **$10 477/мес** (плюс амортизация $2 194/мес):
+
+$$T_{payback} = \frac{\text{CAPEX}}{\text{OPEX}_{cloud} - \text{OPEX}_{own}^{cash}} = \frac{105\,300}{16\,647 - 10\,477} = 17{,}1 \text{ мес}$$
+
+- **Почему на старте остаётся AWS:** экономия на полном выносе GPU (~$4 тыс./мес) — это лишь 2,8% от общего счёта (~$140 тыс./мес), а при снижении реального throughput на стенде вдвое (150 RPS вместо 300) окупаемость растягивается до **40,1 мес**. Поэтому на старте рациональнее AWS, а после подтверждения профиля нагрузкой k6 (§8) имеет смысл рассмотреть **гибрид** (свои 7 × A10 refurb под baseline в US/EU с окупаемостью **9 мес** и сохранением AWS на пиках и в остальных регионах).
+
 ### 11.5 Таблица необходимого оборудования (конфигурации инстансов)
 
 Цены — on-demand `us-east-1` [22], 730 ч/мес; региональный коэффициент для распределённых ресурсов: eu ×1,10, sa ×1,40, ap ×1,15, us-west ×1,00 (взвешенно по DAU ≈ ×1,12). Базовая конфигурация «под Kubernetes» — максимум ядер, много RAM, сетевой диск gp3 под образы/логи; локальные NVMe — у дисковых stateful-нод (i4i).
@@ -1435,6 +1454,34 @@ CPU requests = limits (кроме outbox-relay — асинхронный, не 
 | offline-пул (spot): dwh-consumer ×2, mistakes-builder ×2, hlr-trainer ×2 (8 CPU, суточно), archiver ×2, finalizer ×1 | 28 | 64 Gi | 128 Gi | 9 |
 
 Ёмкость kubenode 20 × 16 = 320 vCPU (allocatable ~85% = 272): утилизация requests 177/272 = **65%**, при отказе 1 ноды в регионе ≤ 80% (N+2 подов переезжают). RAM в избытке (1 280 ГБ против ~60 ГБ requests) — лимитирующий ресурс CPU.
+
+#### Выбор GPU (A10G), отказ от MIG и расчёт шины PCIe
+
+| Карта | VRAM | FP16 dense (Tensor Core) | Полоса памяти | TDP | MIG | RPS/карта* |
+|---|---|---|---|---|---|---|
+| **A10G (AWS G5)** [27] | 24 ГБ GDDR6 | 70 TFLOPS | 600 ГБ/с | 300 Вт | нет | **300** |
+| **A10 (on-prem)** [28] | 24 ГБ GDDR6 | 125 TFLOPS | 600 ГБ/с | 150 Вт | нет | **300** |
+| L4 [29] | 24 ГБ GDDR6 | 121 TFLOPS | 300 ГБ/с | **72 Вт** | нет | 200 |
+| L40S [30] | 48 ГБ GDDR6 | **362 TFLOPS** | 864 ГБ/с | 350 Вт | нет | 900 |
+| A30 [31] | 24 ГБ HBM2 | 165 TFLOPS | 933 ГБ/с | 165 Вт | **да** | 350 |
+| A100 40GB PCIe [32] | 40 ГБ HBM2 | 312 TFLOPS | 1 555 ГБ/с | 250 Вт | да | 600 |
+
+\* Оценка для Conformer-CTC 30M, batch ≤ 32, safety 0,6. Требует подтверждения бенчмарком k6 (§8).
+
+- **Почему A10G, а не L4 или старшие карты:** важно не путать облачную **A10G** (70 TFLOPS FP16 dense, 300 Вт) и серверную **A10** (125 TFLOPS, 150 Вт). По compute у L4 даже выше FP16 TFLOPS (121 vs 70 у A10G), но вдвое уже полоса памяти (**300 vs 600 ГБ/с**), а наш Conformer memory-bound — на L4 потребуется 28–33 карты вместо 24. Карты уровня L40S / A100 избыточны: модель весит **60 МБ** (занято 1,2–1,5% VRAM), а отказ одной карты даёт слишком большой blast radius. Кроме того, NVDEC/NVENC на L4 — видеодекодеры, аудиокодек Opus всё равно декодируется на CPU.
+- **Почему не MIG:** аппаратный MIG есть только у A30 / A100 / H100 / B200 [33]; у A10G, A10, L4 и L40S его нет физически [36], [37]. Но даже на A30 дробление вредит: MIG делит SM, поэтому при `1g.6gb` (25% SM) forward с batch 32 замедляется с 65 до ~260 мс и нарушает SLA 200 мс; уменьшение батча до 8 укладывается в SLA (~113 мс), но снижает суммарный throughput до 284 RPS/карта (−5%). Нашему однородному workload (один процесс, 960 МБ VRAM, 61% занятости SM) вместо MIG подходит **dynamic batching + CUDA MPS ×2** (+10–15% throughput → до ~336 RPS/карта).
+- **Шина PCIe не является узким местом:** на GPU передаётся не аудио, а уже посчитанная на CPU спектрограмма (`log-mel` H2D 31,2 КБ + матрица `A[t,q]` D2H 11,7 КБ ≈ **43 КБ/запрос**, §7.2).
+
+| Уровень | Нагрузка (пик) | Ёмкость | Загрузка |
+|---|---|---|---|
+| Внешняя сеть (Σ регионов) | 1,88 Гбит/с | 4 × 25 GbE | ~2% |
+| **PCIe Gen4 x16 → GPU** (300 RPS) | **13,2 МБ/с** | **31 500 МБ/с** | **0,04%** |
+| Латентность PCIe (H2D+D2H) | < 0,02 мс | бюджет 98 мс | 0,02% |
+| VRAM | 0,96 ГБ/процесс | 24 ГБ | 4% |
+| **CPU (Opus + mel + GoP)** | **~6,9 ядра / карту** | 8 vCPU на `g5.2xlarge` | **86%** ⚠️ |
+| **SM GPU** | 61% времени | 100% | **61%** ← лимит |
+
+> ⚠️ **Уточнение по CPU в Speech-контуре (§11.2):** по §7.2 CPU-часть занимает 23 мс/запрос (5 мс Opus→PCM→mel + 18 мс GoP), что при 300 RPS даёт ~6,9 ядра на карту (vs 4,25 vCPU на карту в §11.2). На `g5.2xlarge` (8 vCPU/карта) запас есть, но впритык — требуется проверка бенчмарком k6.
 
 ### 11.6 Расчёт месячной стоимости
 
@@ -1496,3 +1543,18 @@ $$\text{Удельная стоимость} = \frac{\$140\,000}{52{,}7 \text{ �
 24. <a id="source24"></a>[AWS Savings Plans: Compute Savings Plans 1-year / Spot Instances — Amazon Web Services](https://aws.amazon.com/savingsplans/)
 25. <a id="source25"></a>[Hetzner Dedicated Root Servers (AX/EX-line, локации DE/FI/US/SG) — Hetzner Online](https://www.hetzner.com/dedicated-rootserver)
 26. <a id="source26"></a>[Hostkey Dedicated Servers (локации US/EU/SG/TR, кастомные конфигурации) — Hostkey](https://www.hostkey.com/dedicated-servers)
+27. <a id="source27"></a>[AWS EC2 G5 Instances & NVIDIA A10G — Amazon Web Services](https://aws.amazon.com/ec2/instance-types/g5/)
+28. <a id="source28"></a>[NVIDIA A10 Tensor Core GPU Datasheet (PDF) — NVIDIA](https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/a10/pdf/a10-datasheet.pdf)
+29. <a id="source29"></a>[NVIDIA L4 Tensor Core GPU Product Brief (PDF) — NVIDIA](https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/l4/PB-11316-001_v01.pdf)
+30. <a id="source30"></a>[NVIDIA L40S: 362 TFLOPS, 864 GB/s, 350 W — Lenovo Press](https://lenovopress.lenovo.com/lp1812-nvidia-l40s-48gb-pcie-gen4-passive-gpu)
+31. <a id="source31"></a>[NVIDIA A30 Tensor Core GPU Datasheet (PDF) — NVIDIA](https://www.nvidia.com/content/dam/en-zz/Solutions/data-center/products/a30-gpu/pdf/a30-datasheet.pdf)
+32. <a id="source32"></a>[NVIDIA A100 Tensor Core GPU Datasheet (PDF) — NVIDIA](https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/a100/pdf/nvidia-a100-datasheet-nvidia-us-2188504-web.pdf)
+33. <a id="source33"></a>[MIG User Guide: поддерживаемые GPU — NVIDIA](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/supported-gpus.html)
+34. <a id="source34"></a>[Colocation 2026: Frankfurt $235–265/kW, Singapore ~$403/kW — CBRE](https://www.cbre.com/insights/reports/global-data-center-trends-2026)
+35. <a id="source35"></a>[Colocation NA $190–235/kW, +6,6% г/г — QuoteColo](https://www.quotecolo.com/international-colocation-providers/)
+36. <a id="source36"></a>[MIG не работает на A10G — NVIDIA gpu-operator #506](https://github.com/NVIDIA/gpu-operator/issues/506)
+37. <a id="source37"></a>[L4/L40S/T4 без MIG; time-slicing и MPS — Cloudfleet](https://cloudfleet.ai/learning/gpu-and-ai-infrastructure/gpu-sharing-in-kubernetes/)
+38. <a id="source38"></a>[NVIDIA A10 24GB (от ~$2 999–$3 299) — Newegg](https://www.newegg.com/p/pl?d=NVIDIA+A10+24GB)
+39. <a id="source39"></a>[NVIDIA A10 24GB Refurbished / Enterprise ($2 400–$3 600) — ServerMonkey](https://www.servermonkey.com)
+40. <a id="source40"></a>[Supermicro AS-4125GS-TNRT: 4U GPU-сервер (EPYC 9004/SP5) — Supermicro eStore](https://store.supermicro.com/us_en/systems/a-systems/4u-gpu-superserver-amd-epyc-genoa-as-4125gs-tnrt.html)
+41. <a id="source41"></a>[AMD EPYC 9354 (32-Core, SP5, $1 600–$3 000) — Newegg](https://www.newegg.com/p/pl?d=AMD+EPYC+9354) / [CDW](https://www.cdw.com/search/?key=EPYC+9354)

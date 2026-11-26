@@ -1180,8 +1180,8 @@ flowchart TD
         LeagueFinalizer["League Finalizer (Gamification)<br/>недельный"]
     end
 
-    %% ===== Наблюдаемость: один узел, стек в §8 =====
-    Obs["Наблюдаемость (§8)<br/>OTel → VM / Loki / Tempo → Grafana"]
+    %% ===== Наблюдаемость: один узел-аннотация, стек в §8 =====
+    Obs["Наблюдаемость (§8)<br/>OTel с обоих контуров → VM / Loki / Tempo → Grafana"]
 
     %% ===== Клиентский трафик =====
     Mobile --> Ingress
@@ -1190,7 +1190,7 @@ flowchart TD
     Web --> CDN
     CDN -.->|"origin miss"| S3Content
     Ingress --> APIGW
-    Ingress -->|"speech/*"| S_SPEECH
+    Ingress -->|"speech/*"| SpeechGPU
 
     %% ===== Gateway: одна стрелка маршрутизации; трафик через него подразумевается, зависимости сервисов — напрямую =====
     APIGW -->|"маршрутизация"| S_ONLINE
@@ -1255,10 +1255,6 @@ flowchart TD
     SpeechArchiver -->|"аудио"| S3Speech
     SpeechArchiver -->|"метаданные"| ScyllaSpeech
     LeagueFinalizer -->|"R/W (когорты)"| RedisGamif
-
-    %% ===== Телеметрия =====
-    S_ONLINE -.-> Obs
-    S_OFFLINE -.-> Obs
 
     %% ===== Раскраска по типам узлов =====
     classDef api fill:#e8f0fe,stroke:#4a6fa5,color:#1a2b45
